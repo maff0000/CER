@@ -275,7 +275,134 @@ def test_002_applies_over_populated_001_only_database_and_is_idempotent(tmp_path
         versions = [
             r["version"] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
         ]
-        assert versions == [1, 2]
+        # Every shipped migration, in order: this list grows by one each
+        # time a forward-only migration is added to the schema directory
+        # (003 added optional producer-scoped idempotency keys for
+        # experiments/promotions/health_records).
+        assert versions == [1, 2, 3]
         assert conn.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"] == 2
+    finally:
+        conn.close()
+
+
+def test_003_applies_over_populated_001_002_database_and_is_idempotent(tmp_path):
+    """Migration 003 (optional producer-scoped idempotency keys for
+    experiments, promotions and health_records) must apply cleanly as an
+    upgrade over an existing, already-populated 001+002 database -- the
+    real upgrade path for a deployment that predates it -- leave those
+    rows intact, and enforce the new composite uniqueness afterwards.
+    """
+    real_schema_dir = Path(__file__).resolve().parents[2] / "src" / "cer" / "metadata" / "schema"
+    migration_003 = real_schema_dir / "003_optional_idempotency_keys.sql"
+    assert migration_003.is_file()
+
+    # A database with only 001+002 applied, seeded with rows written
+    # before idempotency keys reached these three tables.
+    pre_003_dir = tmp_path / "schema_pre_003"
+    pre_003_dir.mkdir()
+    for name in ("001_initial.sql", "002_producer_scoped_idempotency.sql"):
+        (pre_003_dir / name).write_text(
+            (real_schema_dir / name).read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    db_path = tmp_path / "upgrade_003.db"
+    conn = _connect(db_path)
+    try:
+        apply_migrations(conn, pre_003_dir)
+
+        conn.execute(
+            "INSERT INTO experiments (experiment_id, objective, producer, created_at) "
+            "VALUES ('exp_old', 'legacy objective', 'HSA', '2026-01-01T00:00:00+00:00')"
+        )
+        conn.execute(
+            "INSERT INTO promotions (transition_id, strategy_id, strategy_version, from_state, "
+            "to_state, at_utc, authority, producer, evidence_ids_json, reason) "
+            "VALUES ('trn_old', 'EMA_PULLBACK', 'v1.0.0', 'DRAFT', 'IMPLEMENTED', "
+            "'2026-01-01T00:00:00+00:00', 'PL', 'HSA', '[\"ev_1\"]', 'legacy reason')"
+        )
+        conn.execute(
+            "INSERT INTO health_records (health_id, strategy_id, strategy_version, health_state, "
+            "observed_at_utc, producer, reason, evidence_ids_json) "
+            "VALUES ('hlt_old', 'EMA_PULLBACK', 'v1.0.0', 'HEALTHY', "
+            "'2026-01-01T00:00:00+00:00', 'NEO', 'legacy reason', '[\"ev_1\"]')"
+        )
+
+        # Apply the full, real, shipped schema directory on top.
+        apply_migrations(conn, real_schema_dir)
+
+        for table in ("experiments", "promotions", "health_records"):
+            columns = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            assert {"idempotency_key", "content_fingerprint"} <= columns, table
+
+        index_names = {
+            r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()
+        }
+        assert "ux_experiments_producer_idempotency_key" in index_names
+        assert "ux_promotions_producer_idempotency_key" in index_names
+        assert "ux_health_records_producer_idempotency_key" in index_names
+
+        # Pre-existing rows survived, with a NULL key (they never had one).
+        assert (
+            conn.execute(
+                "SELECT objective, idempotency_key FROM experiments WHERE experiment_id = 'exp_old'"
+            ).fetchone()["objective"]
+            == "legacy objective"
+        )
+        assert (
+            conn.execute(
+                "SELECT idempotency_key FROM promotions WHERE transition_id = 'trn_old'"
+            ).fetchone()["idempotency_key"]
+            is None
+        )
+        assert (
+            conn.execute(
+                "SELECT idempotency_key FROM health_records WHERE health_id = 'hlt_old'"
+            ).fetchone()["idempotency_key"]
+            is None
+        )
+
+        # The key stays OPTIONAL: the partial index must not make two
+        # keyless rows for the same producer collide.
+        conn.execute(
+            "INSERT INTO promotions (transition_id, strategy_id, strategy_version, from_state, "
+            "to_state, at_utc, authority, producer, evidence_ids_json, reason) "
+            "VALUES ('trn_old_2', 'EMA_PULLBACK', 'v1.0.0', 'IMPLEMENTED', 'BACKTESTED', "
+            "'2026-01-02T00:00:00+00:00', 'PL', 'HSA', '[\"ev_1\"]', 'another keyless row')"
+        )
+
+        # Composite uniqueness is enforced where a key IS present: a
+        # different producer may reuse the same key string...
+        conn.execute(
+            "INSERT INTO promotions (transition_id, strategy_id, strategy_version, from_state, "
+            "to_state, at_utc, authority, producer, evidence_ids_json, reason, "
+            "idempotency_key, content_fingerprint) "
+            "VALUES ('trn_hsa', 'EMA_PULLBACK', 'v1.0.0', 'DRAFT', 'IMPLEMENTED', "
+            "'2026-01-03T00:00:00+00:00', 'PL', 'HSA', '[\"ev_1\"]', 'r', 'shared-key', 'fp1')"
+        )
+        conn.execute(
+            "INSERT INTO promotions (transition_id, strategy_id, strategy_version, from_state, "
+            "to_state, at_utc, authority, producer, evidence_ids_json, reason, "
+            "idempotency_key, content_fingerprint) "
+            "VALUES ('trn_neo', 'EMA_PULLBACK', 'v1.0.0', 'DRAFT', 'IMPLEMENTED', "
+            "'2026-01-03T00:00:00+00:00', 'PL', 'NEO', '[\"ev_1\"]', 'r', 'shared-key', 'fp1')"
+        )
+        # ...but the same producer reusing its own key must not.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO promotions (transition_id, strategy_id, strategy_version, from_state, "
+                "to_state, at_utc, authority, producer, evidence_ids_json, reason, "
+                "idempotency_key, content_fingerprint) "
+                "VALUES ('trn_dup', 'EMA_PULLBACK', 'v1.0.0', 'DRAFT', 'IMPLEMENTED', "
+                "'2026-01-03T00:00:00+00:00', 'PL', 'HSA', '[\"ev_1\"]', 'r', 'shared-key', 'fp1')"
+            )
+
+        # Re-applying the whole shipped schema directory again is a no-op
+        # (003's ALTER TABLEs are never re-run once recorded).
+        apply_migrations(conn, real_schema_dir)
+        versions = [
+            r["version"] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
+        ]
+        assert versions == [1, 2, 3]
+        assert conn.execute("SELECT COUNT(*) AS n FROM promotions").fetchone()["n"] == 4
     finally:
         conn.close()

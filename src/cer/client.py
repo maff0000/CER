@@ -22,9 +22,18 @@ exact same key string without colliding (e.g. both happening to key on
 "today's date"). You never need to coordinate key choice with other
 producers to avoid a collision, and a key you invent cannot be shadowed by
 someone else's. This does mean ``producer`` must be a non-empty string on
-every call that supplies an idempotency key (``create_run``,
-``append_evidence``) — the server rejects a key with no producer as a 400
-``contract_violation`` rather than silently treating it as unscoped.
+every call that supplies an idempotency key — the server rejects a key
+with no producer as a 400 ``contract_violation`` rather than silently
+treating it as unscoped.
+
+Which calls take an idempotency key
+-------------------------------------
+``append_evidence`` requires one. ``create_run``, ``create_experiment``,
+``record_promotion`` and ``record_health`` accept one optionally: pass it
+and your retry of the same call is safe (the stored record comes back,
+no duplicate row); omit it and you get an ordinary create. A materially
+different body under a key you already used is a 409
+``idempotency_conflict``, never a silent overwrite.
 """
 
 from __future__ import annotations
@@ -233,7 +242,11 @@ class CERClient:
         strategy_id: Optional[str] = None,
         strategy_version: Optional[str] = None,
         created_at: Optional[datetime] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Experiment:
+        """Create an experiment. ``idempotency_key`` is optional; when given
+        it is scoped to ``producer`` server-side, so your retry of the same
+        call returns the same experiment instead of minting a second one."""
         body: dict[str, Any] = {
             "objective": objective,
             "producer": producer,
@@ -242,7 +255,12 @@ class CERClient:
         }
         if created_at is not None:
             body["created_at"] = created_at.isoformat()
-        resp = self._request("POST", "/v1/experiments", json_body=body, headers=self._headers())
+        resp = self._request(
+            "POST",
+            "/v1/experiments",
+            json_body=body,
+            headers=self._headers(idempotency_key=idempotency_key),
+        )
         return Experiment.model_validate(resp.json())
 
     def create_run(
@@ -417,7 +435,12 @@ class CERClient:
         reason: str,
         *,
         at_utc: Optional[datetime] = None,
+        idempotency_key: Optional[str] = None,
     ) -> PromotionTransition:
+        """Record a promotion transition. ``idempotency_key`` is optional;
+        when given it is scoped to ``producer``, so a retry re-reads the
+        transition you already recorded rather than recording the same
+        intended transition a second time."""
         body: dict[str, Any] = {
             "strategy_id": strategy_id,
             "strategy_version": strategy_version,
@@ -430,7 +453,12 @@ class CERClient:
         }
         if at_utc is not None:
             body["at_utc"] = at_utc.isoformat()
-        resp = self._request("POST", "/v1/promotions", json_body=body, headers=self._headers())
+        resp = self._request(
+            "POST",
+            "/v1/promotions",
+            json_body=body,
+            headers=self._headers(idempotency_key=idempotency_key),
+        )
         return PromotionTransition.model_validate(resp.json())
 
     def query_promotions(self, **filters: Any) -> list[PromotionTransition]:
@@ -449,8 +477,12 @@ class CERClient:
         evidence_ids: list[str],
         *,
         observed_at_utc: Optional[datetime] = None,
+        idempotency_key: Optional[str] = None,
         **metrics: Union[float, dict, None],
     ) -> StrategyHealthRecord:
+        """Record a strategy-health observation. ``idempotency_key`` is
+        optional; when given it is scoped to ``producer`` and makes a retry
+        of the same observation safe."""
         body: dict[str, Any] = {
             "strategy_id": strategy_id,
             "strategy_version": strategy_version,
@@ -463,7 +495,10 @@ class CERClient:
         if observed_at_utc is not None:
             body["observed_at_utc"] = observed_at_utc.isoformat()
         resp = self._request(
-            "POST", "/v1/health-records", json_body=body, headers=self._headers()
+            "POST",
+            "/v1/health-records",
+            json_body=body,
+            headers=self._headers(idempotency_key=idempotency_key),
         )
         return StrategyHealthRecord.model_validate(resp.json())
 

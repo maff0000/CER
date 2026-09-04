@@ -9,8 +9,11 @@ these exact names and signatures.
 Semantics implementers must honour
 ---------------------------------
 
-* **Idempotency.** :meth:`MetadataStore.create_run` and
-  :meth:`MetadataStore.append_evidence` are idempotent on
+* **Idempotency.** :meth:`MetadataStore.create_run`,
+  :meth:`MetadataStore.append_evidence`,
+  :meth:`MetadataStore.create_experiment`,
+  :meth:`MetadataStore.record_promotion` and
+  :meth:`MetadataStore.record_health` are idempotent on
   ``idempotency_key`` (for ``append_evidence``, the key lives on the
   ``EvidenceRecord`` itself). A replay of the *same* key with an identical
   body must return the existing record unchanged (no new record, no
@@ -18,6 +21,17 @@ Semantics implementers must honour
   :class:`~cer.contract.errors.IdempotencyConflictError` — duplicate
   submissions must be detectable, and duplicate run creation must never
   create ambiguous identities.
+
+  The key is *required* only for ``append_evidence``. On the other four
+  it is optional: given no key, an implementation behaves as it would
+  for any ordinary create (a fresh identity, a new record). Accepting a
+  key and then ignoring it is not a permitted implementation — a
+  producer that supplies one must get the retry-safety it asked for.
+
+  Keys are scoped to the producer, never global: the identity of a key
+  is ``(producer, idempotency_key)``. For ``record_promotion`` and
+  ``record_health`` the producer is taken from the record itself
+  (``PromotionTransition.producer`` / ``StrategyHealthRecord.producer``).
 
 * **Immutability.** Evidence and artifacts are immutable once written.
   Silent replacement is forbidden: writing a second time to the same
@@ -111,7 +125,12 @@ class MetadataStore(Protocol):
 
     def register_strategy_version(self, sv: StrategyVersion) -> StrategyVersion: ...
 
-    def create_experiment(self, experiment: Experiment) -> Experiment: ...
+    def create_experiment(
+        self, experiment: Experiment, *, idempotency_key: str | None = None
+    ) -> Experiment:
+        """Create an experiment. Idempotent on ``idempotency_key`` when one is
+        given — see module docstring."""
+        ...
 
     def create_run(self, run: Run, *, idempotency_key: str | None = None) -> Run:
         """Create a run. Idempotent on ``idempotency_key`` — see module docstring."""
@@ -144,9 +163,21 @@ class MetadataStore(Protocol):
         """
         ...
 
-    def record_promotion(self, transition: PromotionTransition) -> PromotionTransition: ...
+    def record_promotion(
+        self, transition: PromotionTransition, *, idempotency_key: str | None = None
+    ) -> PromotionTransition:
+        """Record a promotion transition. Idempotent on ``idempotency_key``
+        when one is given, scoped to ``transition.producer`` — see module
+        docstring."""
+        ...
 
-    def record_health(self, record: StrategyHealthRecord) -> StrategyHealthRecord: ...
+    def record_health(
+        self, record: StrategyHealthRecord, *, idempotency_key: str | None = None
+    ) -> StrategyHealthRecord:
+        """Record a strategy-health observation. Idempotent on
+        ``idempotency_key`` when one is given, scoped to ``record.producer``
+        — see module docstring."""
+        ...
 
     def get_evidence(self, evidence_id: str) -> EvidenceRecord:
         """Raises ``NotFoundError`` if ``evidence_id`` is unknown."""

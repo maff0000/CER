@@ -44,12 +44,38 @@ this field alone and could never be recognised as a replay, defeating
 idempotency for exactly the callers who rely on it most (ones that don't
 pin their own timestamp). Server-assigned creation timestamps are
 excluded from the fingerprint because the service generates them per
-attempt; caller-authored semantic fields, including ``observed_at_utc``,
-remain part of the content. ``observed_at_utc`` is deliberately *kept in*
+attempt; caller-authored semantic fields, including
+``EvidenceRecord.observed_at_utc``, remain part of the content. The same
+rule -- one rule, one helper, one set of exclusions -- governs every
+comparison in this store: ``Strategy.created_at``,
+``StrategyVersion.created_at``, ``Experiment.created_at``,
+``PromotionTransition.at_utc`` and ``StrategyHealthRecord.observed_at_utc``
+are all stamped by the API layer when the caller omits them, so all are
+excluded. (``StrategyHealthRecord.observed_at_utc`` is the one that reads
+like a caller-authored field but is not: the model requires it, so the
+API defaults it to wall-clock time per attempt, unlike
+``EvidenceRecord.observed_at_utc``, which is left ``None`` when the
+producer omits it and is therefore genuinely caller-authored.)
+Nothing else is excluded: a real content change -- a different
+``thesis``, ``git_commit``, ``verdict`` or metric -- is still detected
+and still refused. ``observed_at_utc`` is deliberately *kept in*
 the fingerprint: it is when the producer says the thing was observed, not
 when the row happened to be created, and a producer that reuses a key
 while genuinely changing the observation time must still get a loud
 ``IdempotencyConflictError``, not a silently-returned stale record.
+
+Writes verify their durable backing before acknowledging
+----------------------------------------------------------
+Every write goes through :meth:`SQLiteMetadataStore._transaction`, which
+first calls :meth:`SQLiteMetadataStore._require_durable_backing` -- the
+same existence check :meth:`SQLiteMetadataStore.health` performs -- and
+raises ``MetadataStoreError`` (HTTP 503) rather than committing into an
+unlinked inode. Without it, a process whose data directory disappeared
+underneath it goes on serving ``201 Created`` for records that are
+already lost: SQLite keeps writing to its open file descriptor, reads
+them straight back, and they vanish at the next restart. A producer that
+receives ``201`` must be able to rely on it, so the write path asks the
+same question ``/ready`` asks.
 
 Idempotency keys are scoped to the producer
 --------------------------------------------
@@ -121,6 +147,41 @@ _RUN_FP_EXCLUDE = {"run_id", "started_at", "provenance_completeness", "missing_p
 #: observed_at_utc is deliberately NOT excluded -- see the module
 #: docstring.
 _EVIDENCE_FP_EXCLUDE = {"evidence_id", "created_at_utc", "provenance_completeness", "missing_provenance"}
+
+#: Registration is idempotent on the record's own natural identity
+#: (strategy_id, or strategy_id+strategy_version): re-registering
+#: identical content is a no-op that returns the stored record, and only
+#: genuinely different content raises ImmutabilityError. created_at is
+#: excluded from that comparison for the same reason it is excluded
+#: everywhere else -- a caller that omits it lets the API layer stamp
+#: wall-clock time at request-handling, regenerated on every attempt, so
+#: comparing it would report an honest retry as an immutability
+#: violation ("your data conflicts with stored history") when nothing
+#: conflicts at all. Everything a caller actually authored -- name,
+#: thesis, git_repo, git_commit, notes -- still participates, so a real
+#: content change is still refused.
+_STRATEGY_FP_EXCLUDE = {"created_at"}
+_STRATEGY_VERSION_FP_EXCLUDE = {"created_at"}
+
+#: Same reasoning as _RUN_FP_EXCLUDE, for the three write paths whose
+#: idempotency key is optional. In each case the record's own generated
+#: identity field is excluded (a caller may mint a fresh id per retry
+#: while reusing the key), and so is the record-creation timestamp the
+#: API layer fills with wall-clock time when the caller omits it --
+#: created_at (Experiment), at_utc (PromotionTransition) and
+#: observed_at_utc (StrategyHealthRecord). Those three are server-assigned
+#: per attempt, exactly like Run.started_at and EvidenceRecord.created_at_utc,
+#: so including them would make every retry a false conflict and defeat
+#: idempotency for the callers who rely on it most. Note the asymmetry
+#: with EvidenceRecord.observed_at_utc, which IS part of the evidence
+#: fingerprint: that field is never server-defaulted (the API leaves it
+#: None when the producer omits it), so it is purely caller-authored,
+#: whereas StrategyHealthRecord.observed_at_utc is required by the model
+#: and defaulted to utcnow() per attempt by the API. Every other content
+#: field participates.
+_EXPERIMENT_FP_EXCLUDE = {"experiment_id", "created_at"}
+_PROMOTION_FP_EXCLUDE = {"transition_id", "at_utc"}
+_HEALTH_FP_EXCLUDE = {"health_id", "observed_at_utc"}
 
 #: artifact_id is the record's own identity (the lookup key, so trivially
 #: equal on both sides already). run_id/evidence_id are excluded because
@@ -222,8 +283,46 @@ class SQLiteMetadataStore:
             self._local.conn = conn
         return conn
 
+    def _require_durable_backing(self, *, detail: str = "") -> None:
+        """Raise ``MetadataStoreError`` unless the database file is still
+        present at its configured path.
+
+        This is the single cheap existence check that both the write path
+        (:meth:`_transaction`) and :meth:`health` are built on, so the
+        two can never disagree about whether the store's durable backing
+        is still there.
+
+        Why the write path needs it at all: SQLite keeps writing happily
+        into an already-open file descriptor whose inode has been
+        unlinked (an unmounted volume, a deleted data directory). Those
+        writes commit, are readable back through the same connection, and
+        are gone at the next restart -- so without this check CER would
+        acknowledge ``201 Created`` for evidence it has already lost,
+        which is the exact opposite of being authoritative for empirical
+        evidence. One ``stat()`` per write is proportionate at CER's
+        scale; nothing here polls, watches or runs in the background.
+
+        This does not (and cannot) defeat POSIX: a path that disappears
+        in the microseconds between this check and the ``COMMIT`` is
+        still lost. It closes the operationally real case -- backing gone
+        for the whole remaining life of the process -- not an
+        instantaneous race.
+        """
+        if not self._db_path.exists():
+            message = f"metadata store database file {self._db_path} does not exist"
+            if detail:
+                message = f"{message}: {detail}"
+            raise MetadataStoreError(message)
+
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
+        # Every write in this store goes through this context manager, so
+        # this is the one place the durable-backing check has to live for
+        # the whole write path -- evidence, runs, promotions, health
+        # records and everything else alike.
+        self._require_durable_backing(
+            detail="refusing to acknowledge a write that could not survive a restart"
+        )
         conn = self._conn
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -274,6 +373,16 @@ class SQLiteMetadataStore:
     # --- Strategy / StrategyVersion ---------------------------------------
 
     def register_strategy(self, strategy: Strategy) -> Strategy:
+        """Register a strategy. Re-registering identical content returns the
+        stored record; genuinely different content raises
+        ``ImmutabilityError``.
+
+        "Identical" ignores the server-assigned ``created_at`` -- see
+        ``_STRATEGY_FP_EXCLUDE``. A producer retrying the same
+        registration must not be told its data conflicts with stored
+        history merely because the API layer stamped a fresh timestamp on
+        the second attempt.
+        """
         with self._transaction() as conn:
             row = conn.execute(
                 "SELECT name, thesis, created_at FROM strategies WHERE strategy_id = ?",
@@ -286,7 +395,11 @@ class SQLiteMetadataStore:
                     thesis=row["thesis"],
                     created_at=_str_to_dt(row["created_at"]),
                 )
-                if existing.model_dump(mode="json") != strategy.model_dump(mode="json"):
+                if _fingerprint(
+                    existing.model_dump(mode="json"), exclude=_STRATEGY_FP_EXCLUDE
+                ) != _fingerprint(
+                    strategy.model_dump(mode="json"), exclude=_STRATEGY_FP_EXCLUDE
+                ):
                     raise ImmutabilityError(
                         f"strategy_id {strategy.strategy_id!r} already registered with different content"
                     )
@@ -298,6 +411,12 @@ class SQLiteMetadataStore:
             return strategy
 
     def register_strategy_version(self, sv: StrategyVersion) -> StrategyVersion:
+        """Register a strategy version. Same semantics as
+        :meth:`register_strategy`: identical content is a no-op returning
+        the stored record, different content raises ``ImmutabilityError``,
+        and the server-assigned ``created_at`` is excluded from that
+        comparison (see ``_STRATEGY_VERSION_FP_EXCLUDE``).
+        """
         with self._transaction() as conn:
             self._require_strategy(conn, sv.strategy_id)
             row = conn.execute(
@@ -314,7 +433,11 @@ class SQLiteMetadataStore:
                     created_at=_str_to_dt(row["created_at"]),
                     notes=row["notes"],
                 )
-                if existing.model_dump(mode="json") != sv.model_dump(mode="json"):
+                if _fingerprint(
+                    existing.model_dump(mode="json"), exclude=_STRATEGY_VERSION_FP_EXCLUDE
+                ) != _fingerprint(
+                    sv.model_dump(mode="json"), exclude=_STRATEGY_VERSION_FP_EXCLUDE
+                ):
                     raise ImmutabilityError(
                         f"strategy_version {sv.strategy_id!r}/{sv.strategy_version!r} "
                         "already registered with different content"
@@ -337,31 +460,75 @@ class SQLiteMetadataStore:
 
     # --- Experiment ---------------------------------------------------------
 
-    def create_experiment(self, experiment: Experiment) -> Experiment:
+    def _row_to_experiment(self, row: sqlite3.Row) -> Experiment:
+        return Experiment(
+            experiment_id=row["experiment_id"],
+            objective=row["objective"],
+            strategy_id=row["strategy_id"],
+            strategy_version=row["strategy_version"],
+            producer=row["producer"],
+            created_at=_str_to_dt(row["created_at"]),
+        )
+
+    def create_experiment(
+        self, experiment: Experiment, *, idempotency_key: str | None = None
+    ) -> Experiment:
+        """Create an experiment, idempotently on ``idempotency_key`` when one
+        is given.
+
+        The key is optional here (unlike ``append_evidence``, where it is
+        required): with no key this behaves exactly as it always has --
+        a fresh row per call. With a key it behaves exactly like
+        ``create_run``: scoped to ``(producer, idempotency_key)``, an
+        identical replay returns the stored experiment, and a materially
+        different body under the same producer and key raises
+        ``IdempotencyConflictError``.
+        """
         with self._transaction() as conn:
+            fp = _fingerprint(
+                experiment.model_dump(mode="json"), exclude=_EXPERIMENT_FP_EXCLUDE
+            )
+
+            if idempotency_key is not None:
+                # Scoped to (producer, idempotency_key), not the key alone
+                # -- see the module docstring.
+                by_key = conn.execute(
+                    "SELECT * FROM experiments WHERE producer = ? AND idempotency_key = ?",
+                    (experiment.producer, idempotency_key),
+                ).fetchone()
+                if by_key is not None:
+                    if by_key["content_fingerprint"] != fp:
+                        raise IdempotencyConflictError(
+                            f"idempotency_key {idempotency_key!r} was already used by "
+                            f"producer {experiment.producer!r} to create an experiment "
+                            "with different content"
+                        )
+                    return self._row_to_experiment(by_key)
+
             row = conn.execute(
-                "SELECT objective, strategy_id, strategy_version, producer, created_at "
-                "FROM experiments WHERE experiment_id = ?",
+                "SELECT * FROM experiments WHERE experiment_id = ?",
                 (experiment.experiment_id,),
             ).fetchone()
             if row is not None:
-                existing = Experiment(
-                    experiment_id=experiment.experiment_id,
-                    objective=row["objective"],
-                    strategy_id=row["strategy_id"],
-                    strategy_version=row["strategy_version"],
-                    producer=row["producer"],
-                    created_at=_str_to_dt(row["created_at"]),
-                )
-                if existing.model_dump(mode="json") != experiment.model_dump(mode="json"):
+                existing = self._row_to_experiment(row)
+                # Deliberately the *same* fingerprint (same exclusions,
+                # same helper) the idempotency-key path above compares.
+                # The two paths must never disagree about whether a given
+                # submission is a replay or a conflict -- and created_at,
+                # stamped per attempt by the API layer, must not turn an
+                # honest retry into an immutability violation.
+                if _fingerprint(
+                    existing.model_dump(mode="json"), exclude=_EXPERIMENT_FP_EXCLUDE
+                ) != fp:
                     raise ImmutabilityError(
                         f"experiment_id {experiment.experiment_id!r} already exists with different content"
                     )
                 return existing
             conn.execute(
                 "INSERT INTO experiments "
-                "(experiment_id, objective, strategy_id, strategy_version, producer, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(experiment_id, objective, strategy_id, strategy_version, producer, "
+                "created_at, idempotency_key, content_fingerprint) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     experiment.experiment_id,
                     experiment.objective,
@@ -369,6 +536,8 @@ class SQLiteMetadataStore:
                     experiment.strategy_version,
                     experiment.producer,
                     _dt_to_str(experiment.created_at),
+                    idempotency_key,
+                    fp,
                 ),
             )
             return experiment
@@ -821,8 +990,40 @@ class SQLiteMetadataStore:
             reason=row["reason"],
         )
 
-    def record_promotion(self, transition: PromotionTransition) -> PromotionTransition:
+    def record_promotion(
+        self, transition: PromotionTransition, *, idempotency_key: str | None = None
+    ) -> PromotionTransition:
+        """Record a promotion transition, idempotently on ``idempotency_key``
+        when one is given.
+
+        The key is optional: with no key this behaves exactly as it always
+        has. With a key it is scoped to the transition's own ``producer``
+        (the record carries it; there is no separate producer argument),
+        an identical replay returns the stored transition, and a
+        materially different body under the same producer and key raises
+        ``IdempotencyConflictError``. Promotion history is a first-class
+        PID deliverable, so one intended transition recorded three times
+        by a retrying producer is corruption, not a harmless duplicate.
+        """
         with self._transaction() as conn:
+            fp = _fingerprint(
+                transition.model_dump(mode="json"), exclude=_PROMOTION_FP_EXCLUDE
+            )
+
+            if idempotency_key is not None:
+                by_key = conn.execute(
+                    "SELECT * FROM promotions WHERE producer = ? AND idempotency_key = ?",
+                    (transition.producer, idempotency_key),
+                ).fetchone()
+                if by_key is not None:
+                    if by_key["content_fingerprint"] != fp:
+                        raise IdempotencyConflictError(
+                            f"idempotency_key {idempotency_key!r} was already used by "
+                            f"producer {transition.producer!r} to record a promotion "
+                            "transition with different content"
+                        )
+                    return self._row_to_promotion(by_key)
+
             row = conn.execute(
                 "SELECT * FROM promotions WHERE transition_id = ?", (transition.transition_id,)
             ).fetchone()
@@ -837,8 +1038,9 @@ class SQLiteMetadataStore:
                 """
                 INSERT INTO promotions (
                     transition_id, strategy_id, strategy_version, from_state, to_state,
-                    at_utc, authority, producer, evidence_ids_json, reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    at_utc, authority, producer, evidence_ids_json, reason,
+                    idempotency_key, content_fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     transition.transition_id,
@@ -851,6 +1053,8 @@ class SQLiteMetadataStore:
                     transition.producer,
                     _dumps(transition.evidence_ids),
                     transition.reason,
+                    idempotency_key,
+                    fp,
                 ),
             )
             return transition
@@ -914,8 +1118,35 @@ class SQLiteMetadataStore:
             evidence_ids=_loads(row["evidence_ids_json"]),
         )
 
-    def record_health(self, record: StrategyHealthRecord) -> StrategyHealthRecord:
+    def record_health(
+        self, record: StrategyHealthRecord, *, idempotency_key: str | None = None
+    ) -> StrategyHealthRecord:
+        """Record a strategy-health observation, idempotently on
+        ``idempotency_key`` when one is given.
+
+        The key is optional: with no key this behaves exactly as it always
+        has. With a key it is scoped to the record's own ``producer``,
+        an identical replay returns the stored record, and a materially
+        different body under the same producer and key raises
+        ``IdempotencyConflictError``.
+        """
         with self._transaction() as conn:
+            fp = _fingerprint(record.model_dump(mode="json"), exclude=_HEALTH_FP_EXCLUDE)
+
+            if idempotency_key is not None:
+                by_key = conn.execute(
+                    "SELECT * FROM health_records WHERE producer = ? AND idempotency_key = ?",
+                    (record.producer, idempotency_key),
+                ).fetchone()
+                if by_key is not None:
+                    if by_key["content_fingerprint"] != fp:
+                        raise IdempotencyConflictError(
+                            f"idempotency_key {idempotency_key!r} was already used by "
+                            f"producer {record.producer!r} to record a health record "
+                            "with different content"
+                        )
+                    return self._row_to_health(by_key)
+
             row = conn.execute(
                 "SELECT * FROM health_records WHERE health_id = ?", (record.health_id,)
             ).fetchone()
@@ -934,8 +1165,9 @@ class SQLiteMetadataStore:
                     expectancy_r, win_rate, drawdown, mae, mfe, holding_time,
                     execution_slippage_quality, regime_distribution_json,
                     strategy_chain_strength_distribution_json, baseline_comparison_json,
-                    confidence, reason, evidence_ids_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    confidence, reason, evidence_ids_json,
+                    idempotency_key, content_fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.health_id,
@@ -961,6 +1193,8 @@ class SQLiteMetadataStore:
                     record.confidence,
                     record.reason,
                     _dumps(record.evidence_ids),
+                    idempotency_key,
+                    fp,
                 ),
             )
             return record
@@ -1005,7 +1239,11 @@ class SQLiteMetadataStore:
         the bug this method used to have. Every check below is against
         the *current* state of the path on disk, via a fresh connection:
 
-        1. the configured database file must still exist at its path;
+        1. the configured database file must still exist at its path
+           (:meth:`_require_durable_backing`, the same check the write
+           path runs before acknowledging anything -- readiness and the
+           write path must never disagree about whether this store's
+           durable backing is still there);
         2. a fresh connection must open it and run a real round-trip read;
         3. ``schema_migrations`` must still record the exact schema
            version this store applied at construction -- a present-but-
@@ -1020,11 +1258,12 @@ class SQLiteMetadataStore:
         path silently creates an empty database file, which is exactly
         the false-healthy side effect this check exists to prevent.
         """
-        if not self._db_path.exists():
+        try:
+            self._require_durable_backing()
+        except MetadataStoreError as exc:
             raise MetadataStoreError(
-                f"metadata store health check failed: database file {self._db_path} "
-                "does not exist"
-            )
+                f"metadata store health check failed: {exc}"
+            ) from exc
 
         conn: sqlite3.Connection | None = None
         try:

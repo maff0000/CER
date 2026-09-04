@@ -84,6 +84,11 @@ class ExperimentCreateRequest(APIModel):
     strategy_id: Optional[str] = None
     strategy_version: Optional[str] = None
     created_at: Optional[datetime] = None
+    #: Optional body-level idempotency key; the ``Idempotency-Key`` header
+    #: is accepted too (a mismatch between the two fails loudly — see
+    #: routes.py). Supplying no key keeps the previous behaviour: a fresh
+    #: id and a new record on every call.
+    idempotency_key: Optional[str] = None
 
 
 class RunCreateRequest(APIModel):
@@ -180,6 +185,11 @@ class PromotionCreateRequest(APIModel):
     producer: str
     evidence_ids: list[str]
     reason: str
+    #: Optional body-level idempotency key; the ``Idempotency-Key`` header
+    #: is accepted too (a mismatch between the two fails loudly — see
+    #: routes.py). Supplying no key keeps the previous behaviour: a fresh
+    #: id and a new record on every call.
+    idempotency_key: Optional[str] = None
 
 
 class HealthRecordCreateRequest(APIModel):
@@ -205,3 +215,8 @@ class HealthRecordCreateRequest(APIModel):
 
     reason: str
     evidence_ids: list[str]
+    #: Optional body-level idempotency key; the ``Idempotency-Key`` header
+    #: is accepted too (a mismatch between the two fails loudly — see
+    #: routes.py). Supplying no key keeps the previous behaviour: a fresh
+    #: id and a new record on every call.
+    idempotency_key: Optional[str] = None

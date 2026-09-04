@@ -29,6 +29,17 @@ idempotency_key)`` constraint. Two different producers submitting the same
 key string are unrelated submissions, each independently idempotent on
 their own retries; one producer's key can never collide with, or be
 rejected because of, another producer's use of the same string.
+
+The fake must not model less than the real store
+--------------------------------------------------
+``create_experiment``, ``record_promotion`` and ``record_health`` take an
+optional ``idempotency_key`` here too, and honour it the same way
+``create_run`` does — because the real ``SQLiteMetadataStore`` does. A
+fake that quietly ignored a key the real store honours (or vice versa)
+is precisely how an earlier defect in this project survived two green
+suites: the API tests would pass against a fake that cannot exhibit the
+bug. Any future change to the real store's idempotency semantics belongs
+here in the same commit.
 """
 
 from __future__ import annotations
@@ -76,6 +87,7 @@ class FakeMetadataStore:
         self._strategies: dict[str, Strategy] = {}
         self._strategy_versions: dict[tuple[str, str], StrategyVersion] = {}
         self._experiments: dict[str, Experiment] = {}
+        self._experiment_idempotency: dict[tuple[str, str], str] = {}
         self._runs: dict[str, Run] = {}
         #: Keyed on (producer, idempotency_key) -- idempotency keys are
         #: scoped per-producer, mirroring the real SQLite store's
@@ -86,7 +98,9 @@ class FakeMetadataStore:
         self._evidence_idempotency: dict[tuple[str, str], str] = {}
         self._artifacts: dict[str, ArtifactRecord] = {}
         self._promotions: list[PromotionTransition] = []
+        self._promotion_idempotency: dict[tuple[str, str], PromotionTransition] = {}
         self._health_records: list[StrategyHealthRecord] = []
+        self._health_idempotency: dict[tuple[str, str], StrategyHealthRecord] = {}
         self.healthy = True
         #: When True, the next representative read/write raises
         #: MetadataStoreError — simulates an operational backend failure
@@ -110,8 +124,34 @@ class FakeMetadataStore:
 
     # --- experiment -------------------------------------------------------
 
-    def create_experiment(self, experiment: Experiment) -> Experiment:
+    @staticmethod
+    def _experiment_body_key(experiment: Experiment) -> tuple:
+        # Excludes the generated identity and the server-defaulted
+        # created_at, mirroring the real store's _EXPERIMENT_FP_EXCLUDE.
+        data = experiment.model_dump(exclude={"experiment_id", "created_at"})
+        return tuple(sorted(data.items(), key=lambda kv: kv[0]))
+
+    def create_experiment(
+        self, experiment: Experiment, *, idempotency_key: Optional[str] = None
+    ) -> Experiment:
+        _boom_if_requested(experiment.producer)
+        if idempotency_key is not None:
+            scoped_key = (experiment.producer, idempotency_key)
+            prior_id = self._experiment_idempotency.get(scoped_key)
+            if prior_id is not None:
+                prior = self._experiments[prior_id]
+                if self._experiment_body_key(prior) == self._experiment_body_key(experiment):
+                    return prior
+                raise IdempotencyConflictError(
+                    f"idempotency key {idempotency_key!r} for producer "
+                    f"{experiment.producer!r} was already used with a different "
+                    "experiment body"
+                )
         self._experiments[experiment.experiment_id] = experiment
+        if idempotency_key is not None:
+            self._experiment_idempotency[(experiment.producer, idempotency_key)] = (
+                experiment.experiment_id
+            )
         return experiment
 
     # --- run ----------------------------------------------------------------
@@ -289,14 +329,60 @@ class FakeMetadataStore:
 
     # --- promotion / health -------------------------------------------------
 
-    def record_promotion(self, transition: PromotionTransition) -> PromotionTransition:
+    @staticmethod
+    def _promotion_body_key(transition: PromotionTransition) -> tuple:
+        # Excludes the generated identity and the server-defaulted at_utc,
+        # mirroring the real store's _PROMOTION_FP_EXCLUDE.
+        data = transition.model_dump(exclude={"transition_id", "at_utc"})
+        return tuple(sorted(data.items(), key=lambda kv: str(kv[0])))
+
+    @staticmethod
+    def _health_body_key(record: StrategyHealthRecord) -> tuple:
+        # Excludes the generated identity and the server-defaulted
+        # observed_at_utc, mirroring the real store's _HEALTH_FP_EXCLUDE.
+        data = record.model_dump(exclude={"health_id", "observed_at_utc"})
+        return tuple(sorted(data.items(), key=lambda kv: str(kv[0])))
+
+    def record_promotion(
+        self, transition: PromotionTransition, *, idempotency_key: Optional[str] = None
+    ) -> PromotionTransition:
         _boom_if_requested(transition.producer)
+        # Producer comes from the record itself, as it does in the real
+        # store -- there is no separate producer argument here.
+        if idempotency_key is not None:
+            scoped_key = (transition.producer, idempotency_key)
+            prior = self._promotion_idempotency.get(scoped_key)
+            if prior is not None:
+                if self._promotion_body_key(prior) == self._promotion_body_key(transition):
+                    return prior
+                raise IdempotencyConflictError(
+                    f"idempotency key {idempotency_key!r} for producer "
+                    f"{transition.producer!r} was already used with a different "
+                    "promotion transition body"
+                )
         self._promotions.append(transition)
+        if idempotency_key is not None:
+            self._promotion_idempotency[(transition.producer, idempotency_key)] = transition
         return transition
 
-    def record_health(self, record: StrategyHealthRecord) -> StrategyHealthRecord:
+    def record_health(
+        self, record: StrategyHealthRecord, *, idempotency_key: Optional[str] = None
+    ) -> StrategyHealthRecord:
         _boom_if_requested(record.producer)
+        if idempotency_key is not None:
+            scoped_key = (record.producer, idempotency_key)
+            prior = self._health_idempotency.get(scoped_key)
+            if prior is not None:
+                if self._health_body_key(prior) == self._health_body_key(record):
+                    return prior
+                raise IdempotencyConflictError(
+                    f"idempotency key {idempotency_key!r} for producer "
+                    f"{record.producer!r} was already used with a different "
+                    "health record body"
+                )
         self._health_records.append(record)
+        if idempotency_key is not None:
+            self._health_idempotency[(record.producer, idempotency_key)] = record
         return record
 
     def query_promotions(

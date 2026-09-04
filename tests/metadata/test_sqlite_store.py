@@ -1185,3 +1185,371 @@ def test_many_threads_can_write_distinct_evidence_concurrently(store):
     assert not errors, errors
     results = store.query_evidence(run_id=run.run_id, limit=100)
     assert len(results) == n_threads
+
+
+# =========================================================================
+# R1 audit remediation
+# =========================================================================
+#
+# Three defects an independent Auditor found and the PL reproduced:
+#
+# A. writes were acknowledged after the durable backing was gone -- the
+#    write path never asked the question /ready was already asking, so
+#    SQLite went on committing into an unlinked inode and the records
+#    vanished at the next restart;
+# C. an Idempotency-Key was silently ignored by create_experiment,
+#    record_promotion and record_health;
+# D. register_strategy/register_strategy_version reported an honest
+#    retry as an ImmutabilityError because the server-stamped created_at
+#    differed between attempts.
+
+
+# --- A: the write path verifies its durable backing ----------------------
+
+
+def _remove_backing_under_live_store(db_path: Path) -> None:
+    """Destroy the store's backing directory without closing the store.
+
+    The point is that the store's cached connection stays open on the
+    now-unlinked inode -- exactly the live-process situation, where
+    connections are established first and the failure arrives later.
+    """
+    shutil.rmtree(db_path.parent)
+    assert not db_path.exists()
+
+
+def test_append_evidence_after_backing_removed_raises_rather_than_acknowledging(store, db_path):
+    experiment, run = _seeded_run(store)
+    store.health()  # sanity: healthy while the backing is present
+
+    _remove_backing_under_live_store(db_path)
+
+    with pytest.raises(MetadataStoreError, match="does not exist"):
+        store.append_evidence(
+            make_evidence(
+                idempotency_key="post-backing-loss",
+                run_id=run.run_id,
+                experiment_id=experiment.experiment_id,
+            )
+        )
+
+
+def test_every_write_path_refuses_after_backing_removed(store, db_path):
+    """Not just append_evidence: a lost promotion transition or health
+    record is no better than lost evidence, so every write goes through
+    the same guard."""
+    experiment, run = _seeded_run(store)
+    _remove_backing_under_live_store(db_path)
+
+    writes = {
+        "register_strategy": lambda: store.register_strategy(make_strategy(strategy_id="OTHER_STRAT")),
+        "register_strategy_version": lambda: store.register_strategy_version(
+            make_strategy_version(strategy_version="v9.9.9")
+        ),
+        "create_experiment": lambda: store.create_experiment(make_experiment()),
+        "create_run": lambda: store.create_run(make_run(experiment.experiment_id)),
+        "close_run": lambda: store.close_run(
+            run.run_id, status=RunStatus.CLOSED, ended_at=_now(10)
+        ),
+        "append_evidence": lambda: store.append_evidence(
+            make_evidence(idempotency_key="every-path", run_id=run.run_id)
+        ),
+        "register_artifact": lambda: store.register_artifact(make_artifact()),
+        "attach_artifact": lambda: store.attach_artifact("art_" + "0" * 64, run_id=run.run_id),
+        "record_promotion": lambda: store.record_promotion(make_promotion()),
+        "record_health": lambda: store.record_health(make_health()),
+    }
+    for name, write in writes.items():
+        with pytest.raises(MetadataStoreError, match="does not exist"):
+            write()
+        assert name  # names the failing case in the pytest output
+
+
+def test_refused_write_is_absent_after_restoring_the_backing(tmp_path):
+    """The refused write must leave nothing behind: after the backing is
+    restored and a fresh store opened on it, the pre-failure record is
+    still there and the refused one is not.
+
+    Builds its own store under a dedicated subdirectory (not the shared
+    ``store``/``db_path`` fixtures) because it has to destroy and restore
+    the whole backing directory without taking the backup copy with it.
+    """
+    meta_dir = tmp_path / "meta"
+    db = meta_dir / "cer.db"
+    backup = tmp_path / "backing_backup"
+
+    store = SQLiteMetadataStore(db)
+    try:
+        experiment, run = _seeded_run(store)
+        survivor = store.append_evidence(
+            make_evidence(idempotency_key="survivor", run_id=run.run_id)
+        )
+
+        shutil.copytree(meta_dir, backup)
+        _remove_backing_under_live_store(db)
+
+        with pytest.raises(MetadataStoreError):
+            store.append_evidence(make_evidence(idempotency_key="phantom", run_id=run.run_id))
+    finally:
+        store.close()
+
+    shutil.copytree(backup, meta_dir)
+    restarted = SQLiteMetadataStore(db)
+    try:
+        restarted.health()
+        keys = {e.idempotency_key for e in restarted.query_evidence(limit=1000)}
+        assert "survivor" in keys
+        assert "phantom" not in keys
+        assert restarted.get_evidence(survivor.evidence_id).evidence_id == survivor.evidence_id
+    finally:
+        restarted.close()
+
+
+def test_health_and_write_path_agree_about_the_backing(store, db_path):
+    """Readiness and the write path must never disagree: whatever /ready
+    says about the metadata store, a write must say the same."""
+    store.health()
+    store.record_promotion(make_promotion())  # both agree: usable
+
+    _remove_backing_under_live_store(db_path)
+
+    with pytest.raises(MetadataStoreError):
+        store.health()
+    with pytest.raises(MetadataStoreError):
+        store.record_promotion(make_promotion(reason="second"))
+
+
+# --- C: optional producer-scoped idempotency keys ------------------------
+
+
+def test_create_experiment_idempotent_replay_returns_existing_record(store):
+    experiment = make_experiment()
+    first = store.create_experiment(experiment, idempotency_key="exp-key-1")
+    # A retry that mints a fresh experiment_id and a fresh created_at --
+    # exactly what the API layer does per attempt -- is still a replay.
+    retry = make_experiment(
+        experiment_id=new_experiment_id(),
+        objective=experiment.objective,
+        producer=experiment.producer,
+        created_at=_now(30),
+    )
+    second = store.create_experiment(retry, idempotency_key="exp-key-1")
+    assert second.experiment_id == first.experiment_id
+    assert second == first
+
+
+def test_create_experiment_idempotency_conflict_raises(store):
+    store.create_experiment(make_experiment(), idempotency_key="exp-key-2")
+    with pytest.raises(IdempotencyConflictError):
+        store.create_experiment(
+            make_experiment(experiment_id=new_experiment_id(), objective="A different objective"),
+            idempotency_key="exp-key-2",
+        )
+
+
+def test_create_experiment_idempotency_key_is_scoped_per_producer(store):
+    a = store.create_experiment(make_experiment(producer="HSA"), idempotency_key="shared-key")
+    b = store.create_experiment(make_experiment(producer="NEO"), idempotency_key="shared-key")
+    assert a.experiment_id != b.experiment_id
+    assert a.producer == "HSA" and b.producer == "NEO"
+
+
+def test_create_experiment_without_a_key_still_creates_distinct_rows(store):
+    a = store.create_experiment(make_experiment())
+    b = store.create_experiment(make_experiment())
+    assert a.experiment_id != b.experiment_id
+
+
+def test_record_promotion_idempotent_replay_returns_existing_record(store):
+    transition = make_promotion()
+    first = store.record_promotion(transition, idempotency_key="promo-key-1")
+    retry = make_promotion(
+        evidence_ids=transition.evidence_ids,
+        at_utc=_now(60),  # server-stamped per attempt; must not conflict
+    )
+    second = store.record_promotion(retry, idempotency_key="promo-key-1")
+    assert second == first
+    assert len(store.query_promotions(strategy_id="EMA_PULLBACK")) == 1
+
+
+def test_record_promotion_retried_three_times_records_one_transition(store):
+    """The Auditor's exact reproduction: one intended transition recorded
+    three times corrupts the promotion history."""
+    transition = make_promotion()
+    for _ in range(3):
+        store.record_promotion(
+            make_promotion(evidence_ids=transition.evidence_ids),
+            idempotency_key="promo-retry",
+        )
+    assert len(store.query_promotions(strategy_id="EMA_PULLBACK")) == 1
+
+
+def test_record_promotion_idempotency_conflict_raises(store):
+    evidence_ids = [new_evidence_id()]
+    store.record_promotion(make_promotion(evidence_ids=evidence_ids), idempotency_key="promo-key-2")
+    with pytest.raises(IdempotencyConflictError):
+        # Identical but for the destination state -- a materially
+        # different transition under a key already used.
+        store.record_promotion(
+            make_promotion(evidence_ids=evidence_ids, to_state=PromotionState.RETIRED),
+            idempotency_key="promo-key-2",
+        )
+
+
+def test_record_promotion_idempotency_key_is_scoped_per_producer(store):
+    evidence_ids = [new_evidence_id()]
+    store.record_promotion(
+        make_promotion(producer="HSA", evidence_ids=evidence_ids), idempotency_key="promo-shared"
+    )
+    store.record_promotion(
+        make_promotion(producer="NEO", evidence_ids=evidence_ids), idempotency_key="promo-shared"
+    )
+    assert len(store.query_promotions(strategy_id="EMA_PULLBACK")) == 2
+
+
+def test_record_promotion_without_a_key_still_records_every_call(store):
+    store.record_promotion(make_promotion())
+    store.record_promotion(make_promotion())
+    assert len(store.query_promotions(strategy_id="EMA_PULLBACK")) == 2
+
+
+def test_record_health_idempotent_replay_returns_existing_record(store):
+    record = make_health()
+    first = store.record_health(record, idempotency_key="health-key-1")
+    retry = make_health(evidence_ids=record.evidence_ids, observed_at_utc=_now(90))
+    second = store.record_health(retry, idempotency_key="health-key-1")
+    assert second == first
+    assert len(store.query_health(strategy_id="EMA_PULLBACK")) == 1
+
+
+def test_record_health_idempotency_conflict_raises(store):
+    evidence_ids = [new_evidence_id()]
+    store.record_health(make_health(evidence_ids=evidence_ids), idempotency_key="health-key-2")
+    with pytest.raises(IdempotencyConflictError):
+        store.record_health(
+            make_health(evidence_ids=evidence_ids, health_state=HealthState.DEGRADED),
+            idempotency_key="health-key-2",
+        )
+
+
+def test_record_health_idempotency_key_is_scoped_per_producer(store):
+    evidence_ids = [new_evidence_id()]
+    store.record_health(
+        make_health(producer="NEO", evidence_ids=evidence_ids), idempotency_key="health-shared"
+    )
+    store.record_health(
+        make_health(producer="APOLLO", evidence_ids=evidence_ids), idempotency_key="health-shared"
+    )
+    assert len(store.query_health(strategy_id="EMA_PULLBACK")) == 2
+
+
+def test_record_health_without_a_key_still_records_every_call(store):
+    store.record_health(make_health())
+    store.record_health(make_health())
+    assert len(store.query_health(strategy_id="EMA_PULLBACK")) == 2
+
+
+def test_idempotent_replays_survive_restart(store, db_path):
+    """A replay after a restart must still be recognised -- the key and
+    fingerprint live in the database, not in process memory."""
+    # Pinned evidence_ids: make_promotion()/make_health() mint a fresh one
+    # per call, which would be a genuine content difference rather than
+    # the byte-identical retry this test is about.
+    evidence_ids = [new_evidence_id()]
+    store.create_experiment(make_experiment(), idempotency_key="restart-exp")
+    store.record_promotion(make_promotion(evidence_ids=evidence_ids), idempotency_key="restart-promo")
+    store.record_health(make_health(evidence_ids=evidence_ids), idempotency_key="restart-health")
+    store.close()
+
+    store2 = SQLiteMetadataStore(db_path)
+    try:
+        store2.create_experiment(make_experiment(), idempotency_key="restart-exp")
+        store2.record_promotion(
+            make_promotion(evidence_ids=evidence_ids), idempotency_key="restart-promo"
+        )
+        store2.record_health(
+            make_health(evidence_ids=evidence_ids), idempotency_key="restart-health"
+        )
+        assert len(store2.query_promotions(strategy_id="EMA_PULLBACK")) == 1
+        assert len(store2.query_health(strategy_id="EMA_PULLBACK")) == 1
+    finally:
+        store2.close()
+
+
+# --- D: a safe retry is not an immutability violation --------------------
+
+
+def test_register_strategy_retry_with_fresh_created_at_is_not_a_conflict(store):
+    """The API layer stamps created_at per attempt when the caller omits
+    it, so a byte-identical retry differs only in that field. That is a
+    safe retry, not a conflict with stored history."""
+    first = store.register_strategy(make_strategy())
+    replay = store.register_strategy(make_strategy(created_at=_now(3600)))
+    assert replay == first
+    assert replay.created_at == first.created_at  # the stored record, not the retry's stamp
+
+
+def test_register_strategy_genuine_content_change_still_raises(store):
+    store.register_strategy(make_strategy())
+    for overrides in ({"name": "Different Name"}, {"thesis": "A different thesis entirely."}):
+        with pytest.raises(ImmutabilityError):
+            store.register_strategy(make_strategy(created_at=_now(3600), **overrides))
+
+
+def test_register_strategy_version_retry_with_fresh_created_at_is_not_a_conflict(store):
+    store.register_strategy(make_strategy())
+    first = store.register_strategy_version(make_strategy_version())
+    replay = store.register_strategy_version(make_strategy_version(created_at=_now(3600)))
+    assert replay == first
+    assert replay.created_at == first.created_at
+
+
+def test_register_strategy_version_genuine_content_change_still_raises(store):
+    store.register_strategy(make_strategy())
+    store.register_strategy_version(make_strategy_version())
+    for overrides in ({"git_commit": "c" * 40}, {"notes": "changed"}):
+        with pytest.raises(ImmutabilityError):
+            store.register_strategy_version(
+                make_strategy_version(created_at=_now(3600), **overrides)
+            )
+
+
+def test_create_experiment_retry_with_fresh_created_at_is_not_a_conflict(store):
+    experiment = make_experiment()
+    first = store.create_experiment(experiment)
+    replay = store.create_experiment(experiment.model_copy(update={"created_at": _now(3600)}))
+    assert replay == first
+    assert replay.created_at == first.created_at
+
+
+def test_create_experiment_genuine_content_change_still_raises(store):
+    experiment = make_experiment()
+    store.create_experiment(experiment)
+    with pytest.raises(ImmutabilityError):
+        store.create_experiment(
+            experiment.model_copy(
+                update={"objective": "A different objective", "created_at": _now(3600)}
+            )
+        )
+
+
+def test_experiment_key_path_and_content_path_agree(store):
+    """The idempotency-key replay path and the by-id content-comparison
+    path must not disagree about whether a submission is a replay: the
+    same body under the same key, and the same body under the same id,
+    must both be treated as replays."""
+    experiment = make_experiment()
+    by_key = store.create_experiment(experiment, idempotency_key="agree-key")
+    # same id, fresh timestamp, no key -> content path
+    by_id = store.create_experiment(experiment.model_copy(update={"created_at": _now(120)}))
+    # same key, fresh id and timestamp -> key path
+    by_key_again = store.create_experiment(
+        make_experiment(
+            experiment_id=new_experiment_id(),
+            objective=experiment.objective,
+            producer=experiment.producer,
+            created_at=_now(240),
+        ),
+        idempotency_key="agree-key",
+    )
+    assert by_id == by_key == by_key_again

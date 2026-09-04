@@ -102,12 +102,211 @@ def test_byte_identical_run_retry_returns_stored_record(client):
     assert r1.json()["run_id"] == r2.json()["run_id"]
 
 
+def _promotion_body(**overrides) -> dict:
+    body = {
+        "strategy_id": "FAULT_IDEMP_S",
+        "strategy_version": "v1.0.0",
+        "from_state": "DRAFT",
+        "to_state": "IMPLEMENTED",
+        "authority": "PL",
+        "producer": "HSA",
+        "evidence_ids": ["ev_" + "a" * 32],
+        "reason": "Implementation complete.",
+    }
+    body.update(overrides)
+    return body
+
+
+def _health_body(**overrides) -> dict:
+    body = {
+        "strategy_id": "FAULT_IDEMP_S",
+        "strategy_version": "v1.0.0",
+        "health_state": "HEALTHY",
+        "producer": "NEO",
+        "reason": "Consistent with baseline.",
+        "evidence_ids": ["ev_" + "b" * 32],
+    }
+    body.update(overrides)
+    return body
+
+
+def test_experiment_retry_with_idempotency_key_returns_stored_record(client):
+    """Against the REAL store: POST /v1/experiments used to accept an
+    Idempotency-Key, return 201 and ignore it -- a fresh id and a new row
+    on every retry."""
+    hdrs = headers(**{"Idempotency-Key": "fault-exp-key"})
+    body = {"objective": "fault idempotent experiment", "producer": "HSA"}
+    r1 = client.post("/v1/experiments", json=body, headers=hdrs)
+    r2 = client.post("/v1/experiments", json=body, headers=hdrs)
+    assert r1.status_code == 201 and r2.status_code == 201, r2.text
+    assert r1.json() == r2.json()
+
+
+def test_experiment_conflicting_retry_same_key_is_409(client):
+    hdrs = headers(**{"Idempotency-Key": "fault-exp-key-2"})
+    r1 = client.post("/v1/experiments", json={"objective": "a", "producer": "HSA"}, headers=hdrs)
+    assert r1.status_code == 201, r1.text
+    r2 = client.post("/v1/experiments", json={"objective": "b", "producer": "HSA"}, headers=hdrs)
+    assert r2.status_code == 409
+    assert r2.json()["code"] == "idempotency_conflict"
+
+
+def test_promotion_retried_three_times_records_one_transition(client):
+    """Against the REAL store: the Auditor demonstrated one intended
+    promotion transition recorded three times, corrupting the promotion
+    history that is itself a first-class PID deliverable."""
+    hdrs = headers(**{"Idempotency-Key": "fault-promo-key"})
+    responses = [client.post("/v1/promotions", json=_promotion_body(), headers=hdrs) for _ in range(3)]
+    for resp in responses:
+        assert resp.status_code == 201, resp.text
+    assert responses[0].json() == responses[1].json() == responses[2].json()
+
+    listed = client.get("/v1/promotions", params={"strategy_id": "FAULT_IDEMP_S"}, headers=headers())
+    assert listed.status_code == 200
+    assert len(listed.json()) == 1
+
+
+def test_promotion_conflicting_retry_same_key_is_409(client):
+    hdrs = headers(**{"Idempotency-Key": "fault-promo-key-2"})
+    r1 = client.post("/v1/promotions", json=_promotion_body(), headers=hdrs)
+    assert r1.status_code == 201, r1.text
+    r2 = client.post("/v1/promotions", json=_promotion_body(to_state="RETIRED"), headers=hdrs)
+    assert r2.status_code == 409
+    assert r2.json()["code"] == "idempotency_conflict"
+
+
+def test_health_record_retry_with_idempotency_key_returns_stored_record(client):
+    hdrs = headers(**{"Idempotency-Key": "fault-health-key"})
+    r1 = client.post("/v1/health-records", json=_health_body(), headers=hdrs)
+    r2 = client.post("/v1/health-records", json=_health_body(), headers=hdrs)
+    assert r1.status_code == 201 and r2.status_code == 201, r2.text
+    assert r1.json() == r2.json()
+
+    listed = client.get(
+        "/v1/health-records", params={"strategy_id": "FAULT_IDEMP_S"}, headers=headers()
+    )
+    assert len(listed.json()) == 1
+
+
+def test_health_record_conflicting_retry_same_key_is_409(client):
+    hdrs = headers(**{"Idempotency-Key": "fault-health-key-2"})
+    r1 = client.post("/v1/health-records", json=_health_body(), headers=hdrs)
+    assert r1.status_code == 201, r1.text
+    r2 = client.post("/v1/health-records", json=_health_body(health_state="DEGRADED"), headers=hdrs)
+    assert r2.status_code == 409
+    assert r2.json()["code"] == "idempotency_conflict"
+
+
+def test_optional_key_omitted_still_creates_a_record_on_every_call(client):
+    """The key is optional on all three: omitting it must behave exactly
+    as it did before -- a fresh id and a new row."""
+    e1 = client.post("/v1/experiments", json={"objective": "o", "producer": "HSA"}, headers=headers())
+    e2 = client.post("/v1/experiments", json={"objective": "o", "producer": "HSA"}, headers=headers())
+    assert e1.json()["experiment_id"] != e2.json()["experiment_id"]
+
+    client.post("/v1/promotions", json=_promotion_body(strategy_id="FAULT_OPT_S"), headers=headers())
+    client.post("/v1/promotions", json=_promotion_body(strategy_id="FAULT_OPT_S"), headers=headers())
+    listed = client.get("/v1/promotions", params={"strategy_id": "FAULT_OPT_S"}, headers=headers())
+    assert len(listed.json()) == 2
+
+    client.post("/v1/health-records", json=_health_body(strategy_id="FAULT_OPT_S"), headers=headers())
+    client.post("/v1/health-records", json=_health_body(strategy_id="FAULT_OPT_S"), headers=headers())
+    listed = client.get("/v1/health-records", params={"strategy_id": "FAULT_OPT_S"}, headers=headers())
+    assert len(listed.json()) == 2
+
+
+def test_safe_retry_of_strategy_registration_is_not_an_immutability_error(client):
+    """A producer that re-sends an identical registration (letting the
+    server stamp created_at both times) is retrying, not conflicting with
+    stored history -- 201 with the stored record, not 409."""
+    body = {"strategy_id": "RETRY_STRAT", "name": "Retry", "thesis": "t"}
+    r1 = client.post("/v1/strategies", json=body, headers=headers())
+    r2 = client.post("/v1/strategies", json=body, headers=headers())
+    assert r1.status_code == 201, r1.text
+    assert r2.status_code == 201, r2.text
+    assert r1.json() == r2.json()  # the stored record, including its original created_at
+
+    version_body = {"strategy_version": "v1.0.0", "git_repo": "git@x:y.git", "git_commit": "a" * 40}
+    v1 = client.post("/v1/strategies/RETRY_STRAT/versions", json=version_body, headers=headers())
+    v2 = client.post("/v1/strategies/RETRY_STRAT/versions", json=version_body, headers=headers())
+    assert v1.status_code == 201, v1.text
+    assert v2.status_code == 201, v2.text
+    assert v1.json() == v2.json()
+
+    # A genuine content change is still refused.
+    conflict = client.post(
+        "/v1/strategies",
+        json={"strategy_id": "RETRY_STRAT", "name": "Retry", "thesis": "a different thesis"},
+        headers=headers(),
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["code"] == "immutability_violation"
+
+    version_conflict = client.post(
+        "/v1/strategies/RETRY_STRAT/versions",
+        json={"strategy_version": "v1.0.0", "git_repo": "git@x:y.git", "git_commit": "b" * 40},
+        headers=headers(),
+    )
+    assert version_conflict.status_code == 409
+    assert version_conflict.json()["code"] == "immutability_violation"
+
+
+def test_idempotent_replays_are_recognised_after_restart(tmp_path):
+    """The key and its content fingerprint live in the database, so a
+    retry that arrives after a restart is still recognised as a replay --
+    not recorded a second time."""
+    settings = make_settings(tmp_path)
+    store1 = SQLiteMetadataStore(settings.metadata_db_path)
+    art1 = FilesystemArtifactStore(settings.artifact_root, max_bytes=settings.max_artifact_bytes)
+    art1.initialise()
+    hdrs = headers(**{"Idempotency-Key": "restart-promo-key"})
+
+    with TestClient(create_app(store1, art1, settings), raise_server_exceptions=False) as c1:
+        before = c1.post("/v1/promotions", json=_promotion_body(), headers=hdrs)
+        assert before.status_code == 201, before.text
+    store1.close()
+
+    store2 = SQLiteMetadataStore(settings.metadata_db_path)
+    art2 = FilesystemArtifactStore(settings.artifact_root, max_bytes=settings.max_artifact_bytes)
+    art2.initialise()
+    try:
+        with TestClient(create_app(store2, art2, settings), raise_server_exceptions=False) as c2:
+            after = c2.post("/v1/promotions", json=_promotion_body(), headers=hdrs)
+            assert after.status_code == 201, after.text
+            assert after.json() == before.json()
+
+            listed = c2.get(
+                "/v1/promotions", params={"strategy_id": "FAULT_IDEMP_S"}, headers=headers()
+            )
+            assert len(listed.json()) == 1
+    finally:
+        store2.close()
+
+
 # =====================================================================
 # Metadata-store failure (genuine)
 # =====================================================================
 
 
 def test_metadata_store_genuinely_unavailable_is_503_on_ready_and_on_write(tmp_path):
+    """The real ordering: connections are established first, the failure
+    arrives later.
+
+    This test used to construct its ``TestClient`` *after* destroying the
+    store directory, so the serving thread had no cached connection and
+    failed cleanly on its first attempt to open one. That is the reverse
+    of what happens on a running service, and it let a real defect pass a
+    green suite: on the live container, writes carried on being
+    acknowledged ``201 Created`` after the metadata directory was deleted
+    (SQLite keeps writing to an open file descriptor whose inode has been
+    unlinked), and every one of those records was gone at the next
+    restart. ``/ready`` told the truth throughout; the write path never
+    asked.
+
+    So: build the app and client, write successfully so a connection is
+    genuinely established and cached, *then* destroy the backing
+    directory, and only then assert.
+    """
     meta_dir = tmp_path / "meta"
     db_path = meta_dir / "cer.db"
     settings = make_settings(tmp_path, metadata_db_path=str(db_path))
@@ -116,13 +315,41 @@ def test_metadata_store_genuinely_unavailable_is_503_on_ready_and_on_write(tmp_p
     artifact_store = FilesystemArtifactStore(settings.artifact_root, max_bytes=settings.max_artifact_bytes)
     artifact_store.initialise()
     app = create_app(metadata_store, artifact_store, settings)
-
     assert meta_dir.is_dir()
-    # Genuinely destroy the backing storage -- not a permission trick.
-    shutil.rmtree(meta_dir)
-    assert not meta_dir.exists()
 
     with TestClient(app, raise_server_exceptions=False) as client:
+        # --- connections first --------------------------------------
+        assert client.get("/ready").status_code == 200
+        established = client.post(
+            "/v1/evidence",
+            json={
+                "evidence_type": "BACKTEST",
+                "schema_version": 1,
+                "producer": "HSA",
+                "idempotency_key": "before-the-volume-vanished",
+                "verdict": "PROMISING",
+            },
+            headers=headers(),
+        )
+        assert established.status_code == 201, established.text
+
+        # Also establish a cached connection on *this* thread, so the
+        # "the process could have gone on writing" assertion below is
+        # deterministic rather than depending on which worker thread the
+        # app happened to serve the request from.
+        assert metadata_store.query_evidence(limit=10)
+
+        # --- failure later ------------------------------------------
+        # Genuinely destroy the backing storage -- not a permission trick.
+        shutil.rmtree(meta_dir)
+        assert not meta_dir.exists()
+
+        # The cached connection really is still alive on the now-unlinked
+        # inode: a read through it still succeeds. So the refusals below
+        # are the write path's own durable-backing check, not an
+        # incidental "could not open the database file".
+        assert metadata_store.query_evidence(limit=10)
+
         # /ready must call health() for real and report which dependency
         # failed -- never cached, never a false positive.
         resp = client.get("/ready")
@@ -131,7 +358,8 @@ def test_metadata_store_genuinely_unavailable_is_503_on_ready_and_on_write(tmp_p
         assert body["failed_dependency"] == "metadata_store"
 
         # A write attempt must surface a clean 503 CER error, never a raw
-        # traceback or an unhandled 500.
+        # traceback or an unhandled 500 -- and above all never a 201 for a
+        # record that is already lost.
         resp2 = client.post(
             "/v1/strategies",
             json={"strategy_id": "FAULT_META", "name": "n", "thesis": "t"},
@@ -146,6 +374,106 @@ def test_metadata_store_genuinely_unavailable_is_503_on_ready_and_on_write(tmp_p
         # 500 path, which must leak nothing -- see test_unexpected_error
         # coverage in tests/api/test_errors.py).
         assert "traceback" not in resp2.text.lower()
+
+        # The durable write producers actually care about is refused too,
+        # and refused the same way.
+        resp3 = client.post(
+            "/v1/evidence",
+            json={
+                "evidence_type": "BACKTEST",
+                "schema_version": 1,
+                "producer": "HSA",
+                "idempotency_key": "after-the-volume-vanished",
+                "verdict": "PROMISING",
+            },
+            headers=headers(),
+        )
+        assert resp3.status_code == 503, resp3.text
+        assert resp3.json()["code"] == "metadata_store_error"
+
+    metadata_store.close()
+
+
+def test_write_refused_after_backing_loss_leaves_no_phantom_record(tmp_path):
+    """A write refused because the backing vanished must leave nothing
+    behind: restore the store, restart, and the refused submission must be
+    absent while everything written before the failure is still there.
+
+    This is the other half of the acknowledged-then-lost defect. A 503 is
+    only honest if it really means "not recorded".
+    """
+    meta_dir = tmp_path / "meta"
+    db_path = meta_dir / "cer.db"
+    backup_dir = tmp_path / "meta_backup"
+    settings = make_settings(tmp_path, metadata_db_path=str(db_path))
+
+    metadata_store_1 = SQLiteMetadataStore(db_path)
+    artifact_store_1 = FilesystemArtifactStore(settings.artifact_root, max_bytes=settings.max_artifact_bytes)
+    artifact_store_1.initialise()
+    app1 = create_app(metadata_store_1, artifact_store_1, settings)
+
+    survivor_key = "phantom-test-survivor"
+    phantom_key = "phantom-test-refused"
+
+    with TestClient(app1, raise_server_exceptions=False) as client1:
+        resp = client1.post(
+            "/v1/evidence",
+            json={
+                "evidence_type": "BACKTEST",
+                "schema_version": 1,
+                "producer": "HSA",
+                "idempotency_key": survivor_key,
+                "strategy_id": "PHANTOM_STRAT",
+                "verdict": "PROMISING",
+            },
+            headers=headers(),
+        )
+        assert resp.status_code == 201, resp.text
+        survivor_id = resp.json()["evidence_id"]
+
+        # Snapshot the intact store, then destroy it under the live process.
+        shutil.copytree(meta_dir, backup_dir)
+        shutil.rmtree(meta_dir)
+
+        refused = client1.post(
+            "/v1/evidence",
+            json={
+                "evidence_type": "BACKTEST",
+                "schema_version": 1,
+                "producer": "HSA",
+                "idempotency_key": phantom_key,
+                "strategy_id": "PHANTOM_STRAT",
+                "verdict": "REJECTED",
+            },
+            headers=headers(),
+        )
+        assert refused.status_code == 503, refused.text
+        assert refused.json()["code"] == "metadata_store_error"
+
+    metadata_store_1.close()
+
+    # --- restore the backing and restart -----------------------------
+    shutil.copytree(backup_dir, meta_dir)
+    metadata_store_2 = SQLiteMetadataStore(db_path)
+    artifact_store_2 = FilesystemArtifactStore(settings.artifact_root, max_bytes=settings.max_artifact_bytes)
+    artifact_store_2.initialise()
+    app2 = create_app(metadata_store_2, artifact_store_2, settings)
+
+    try:
+        with TestClient(app2, raise_server_exceptions=False) as client2:
+            assert client2.get("/ready").status_code == 200
+
+            listed = client2.get(
+                "/v1/evidence", params={"strategy_id": "PHANTOM_STRAT"}, headers=headers()
+            )
+            assert listed.status_code == 200
+            keys = {e["idempotency_key"] for e in listed.json()}
+            assert survivor_key in keys, "the write made before the failure must survive"
+            assert phantom_key not in keys, "the refused write must not have been recorded"
+
+            assert client2.get(f"/v1/evidence/{survivor_id}", headers=headers()).status_code == 200
+    finally:
+        metadata_store_2.close()
 
 
 # =====================================================================

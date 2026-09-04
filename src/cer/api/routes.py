@@ -8,9 +8,8 @@ plumbing described below — the stores own everything else.
 
 Identity generation
 --------------------
-``experiment_id`` is always freshly generated (``create_experiment`` is not
-documented as idempotent in ``cer.contract.stores``). ``run_id`` and
-``evidence_id`` are generated *deterministically* from the caller's
+``run_id``, ``evidence_id``, ``experiment_id``, ``transition_id`` and
+``health_id`` are generated *deterministically* from the caller's
 idempotency key when one is given (see :func:`_generate_id`): this is what
 makes "replay the same key with the same body" actually produce a
 byte-identical record for the store to recognise as the same submission,
@@ -18,8 +17,29 @@ rather than a fresh id every time defeating idempotency at the API layer
 before the store ever sees it. Without an idempotency key, ids are random
 per the normal case.
 
+Which endpoints take an idempotency key
+-----------------------------------------
+``POST /v1/evidence`` *requires* one. ``POST /v1/experiments/{id}/runs``,
+``POST /v1/experiments``, ``POST /v1/promotions`` and
+``POST /v1/health-records`` accept one *optionally* — as the
+``Idempotency-Key`` header or the body's ``idempotency_key`` field — and
+honour it identically: producer-scoped, deterministic id derivation,
+replay returns the stored record, materially different body under the
+same producer and key is a 409. Omitting it keeps the plain-create
+behaviour (fresh id, new record). The PID's clause — "ingestion must
+tolerate safe retries; duplicate submissions must be detectable via
+idempotency key or equivalent" — is not scoped to evidence and runs, and
+accepting a header that silently does nothing is worse than rejecting
+it: a retrying producer would record one intended promotion transition
+several times and corrupt the promotion history that is itself a
+first-class PID deliverable.
+
 Idempotency keys are scoped to the producer, not global
 ---------------------------------------------------------
+For ``/v1/promotions`` and ``/v1/health-records`` the producer used for
+scoping is the one in the request body — the same value stored on the
+record itself — consistent with the other endpoints.
+
 An idempotency key is only unique *within* the producer that supplied it:
 the deterministic derivation is ``uuid5(namespace, f"{kind}:{producer}:{key}")``,
 not ``f"{kind}:{key}"``. Two different producers may safely use the exact
@@ -230,16 +250,18 @@ def create_strategy_version(
 def create_experiment(
     body: sch.ExperimentCreateRequest,
     metadata_store: MetadataStore = Depends(get_metadata_store),
+    idempotency_key_header: Optional[str] = Header(default=None, alias=IDEMPOTENCY_KEY_HEADER),
 ) -> Experiment:
+    idem_key = _resolve_idempotency_key(idempotency_key_header, body.idempotency_key)
     experiment = Experiment(
-        experiment_id=_generate_id("exp_", "experiment", None),
+        experiment_id=_generate_id("exp_", "experiment", idem_key, body.producer),
         objective=body.objective,
         strategy_id=body.strategy_id,
         strategy_version=body.strategy_version,
         producer=body.producer,
         created_at=body.created_at or utcnow(),
     )
-    return metadata_store.create_experiment(experiment)
+    return metadata_store.create_experiment(experiment, idempotency_key=idem_key)
 
 
 @api_router.post("/experiments/{experiment_id}/runs", response_model=Run, status_code=201)
@@ -486,8 +508,11 @@ def attach_artifact(
 def create_promotion(
     body: sch.PromotionCreateRequest,
     metadata_store: MetadataStore = Depends(get_metadata_store),
+    idempotency_key_header: Optional[str] = Header(default=None, alias=IDEMPOTENCY_KEY_HEADER),
 ) -> PromotionTransition:
+    idem_key = _resolve_idempotency_key(idempotency_key_header, body.idempotency_key)
     transition = PromotionTransition(
+        transition_id=_generate_id("trn_", "promotion", idem_key, body.producer),
         strategy_id=body.strategy_id,
         strategy_version=body.strategy_version,
         from_state=body.from_state,
@@ -498,7 +523,7 @@ def create_promotion(
         evidence_ids=body.evidence_ids,
         reason=body.reason,
     )
-    return metadata_store.record_promotion(transition)
+    return metadata_store.record_promotion(transition, idempotency_key=idem_key)
 
 
 @api_router.get("/promotions", response_model=list[PromotionTransition])
@@ -521,8 +546,11 @@ def query_promotions(
 def create_health_record(
     body: sch.HealthRecordCreateRequest,
     metadata_store: MetadataStore = Depends(get_metadata_store),
+    idempotency_key_header: Optional[str] = Header(default=None, alias=IDEMPOTENCY_KEY_HEADER),
 ) -> StrategyHealthRecord:
+    idem_key = _resolve_idempotency_key(idempotency_key_header, body.idempotency_key)
     record = StrategyHealthRecord(
+        health_id=_generate_id("hlt_", "health", idem_key, body.producer),
         strategy_id=body.strategy_id,
         strategy_version=body.strategy_version,
         health_state=body.health_state,
@@ -544,7 +572,7 @@ def create_health_record(
         reason=body.reason,
         evidence_ids=body.evidence_ids,
     )
-    return metadata_store.record_health(record)
+    return metadata_store.record_health(record, idempotency_key=idem_key)
 
 
 @api_router.get("/health-records", response_model=list[StrategyHealthRecord])

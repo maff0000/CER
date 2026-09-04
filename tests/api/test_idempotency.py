@@ -264,3 +264,196 @@ def test_run_idempotency_key_with_empty_producer_is_400(client):
     )
     assert resp.status_code == 400
     assert resp.json()["code"] == "contract_violation"
+
+
+# =========================================================================
+# Experiments / promotions / health records (R1 audit remediation, C)
+# =========================================================================
+#
+# These three endpoints used to accept an Idempotency-Key, return 201 and
+# ignore it: every retry minted a new id and a new row, so one intended
+# promotion transition could be recorded three times. The PID's clause
+# ("ingestion must tolerate safe retries; duplicate submissions must be
+# detectable via idempotency key or equivalent") is not scoped to evidence
+# and runs. The key stays OPTIONAL on all three -- omitting it must keep
+# behaving exactly as it did.
+
+
+def _promotion_body(**overrides) -> dict:
+    body = {
+        "strategy_id": "IDEMP_S",
+        "strategy_version": "v1.0.0",
+        "from_state": "DRAFT",
+        "to_state": "IMPLEMENTED",
+        "authority": "PL",
+        "producer": "HSA",
+        "evidence_ids": ["ev_" + "a" * 32],
+        "reason": "Implementation complete.",
+    }
+    body.update(overrides)
+    return body
+
+
+def _health_body(**overrides) -> dict:
+    body = {
+        "strategy_id": "IDEMP_S",
+        "strategy_version": "v1.0.0",
+        "health_state": "HEALTHY",
+        "producer": "NEO",
+        "reason": "Consistent with baseline.",
+        "evidence_ids": ["ev_" + "b" * 32],
+    }
+    body.update(overrides)
+    return body
+
+
+# --- experiments ---------------------------------------------------------
+
+
+def test_experiment_idempotent_replay_via_header_returns_same_record(client):
+    body = {"objective": "o", "producer": "HSA"}
+    hdrs = headers(**{"Idempotency-Key": "exp-key-1"})
+    r1 = client.post("/v1/experiments", json=body, headers=hdrs)
+    r2 = client.post("/v1/experiments", json=body, headers=hdrs)
+    assert r1.status_code == 201, r1.text
+    assert r2.status_code == 201, r2.text
+    assert r1.json()["experiment_id"] == r2.json()["experiment_id"]
+    assert r1.json() == r2.json()
+
+
+def test_experiment_idempotent_replay_via_body_field(client):
+    body = {"objective": "o", "producer": "HSA", "idempotency_key": "exp-key-body"}
+    r1 = client.post("/v1/experiments", json=body, headers=headers())
+    r2 = client.post("/v1/experiments", json=body, headers=headers())
+    assert r1.json()["experiment_id"] == r2.json()["experiment_id"]
+
+
+def test_experiment_conflicting_replay_is_409(client):
+    hdrs = headers(**{"Idempotency-Key": "exp-key-2"})
+    r1 = client.post("/v1/experiments", json={"objective": "o", "producer": "HSA"}, headers=hdrs)
+    assert r1.status_code == 201, r1.text
+    r2 = client.post(
+        "/v1/experiments", json={"objective": "a different objective", "producer": "HSA"}, headers=hdrs
+    )
+    assert r2.status_code == 409
+    assert r2.json()["code"] == "idempotency_conflict"
+
+
+def test_experiment_without_a_key_still_mints_a_new_record(client):
+    """The key is optional: no key means the previous behaviour."""
+    body = {"objective": "o", "producer": "HSA"}
+    r1 = client.post("/v1/experiments", json=body, headers=headers())
+    r2 = client.post("/v1/experiments", json=body, headers=headers())
+    assert r1.status_code == 201 and r2.status_code == 201
+    assert r1.json()["experiment_id"] != r2.json()["experiment_id"]
+
+
+def test_experiment_same_key_different_producers_do_not_collide(client):
+    hdrs = headers(**{"Idempotency-Key": "exp-shared-key"})
+    r1 = client.post("/v1/experiments", json={"objective": "o", "producer": "HSA"}, headers=hdrs)
+    r2 = client.post("/v1/experiments", json={"objective": "o", "producer": "NEO"}, headers=hdrs)
+    assert r1.status_code == 201 and r2.status_code == 201
+    assert r1.json()["experiment_id"] != r2.json()["experiment_id"]
+
+
+def test_experiment_header_body_key_mismatch_is_rejected(client):
+    resp = client.post(
+        "/v1/experiments",
+        json={"objective": "o", "producer": "HSA", "idempotency_key": "body-key"},
+        headers=headers(**{"Idempotency-Key": "header-key"}),
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "contract_violation"
+
+
+# --- promotions ----------------------------------------------------------
+
+
+def test_promotion_idempotent_replay_returns_same_transition(client):
+    hdrs = headers(**{"Idempotency-Key": "promo-key-1"})
+    r1 = client.post("/v1/promotions", json=_promotion_body(), headers=hdrs)
+    r2 = client.post("/v1/promotions", json=_promotion_body(), headers=hdrs)
+    assert r1.status_code == 201, r1.text
+    assert r2.status_code == 201, r2.text
+    assert r1.json()["transition_id"] == r2.json()["transition_id"]
+    assert r1.json() == r2.json()
+
+
+def test_promotion_retried_three_times_records_one_transition(client):
+    """The Auditor's reproduction: one intended transition recorded three
+    times corrupts the promotion history, which is a first-class PID
+    deliverable."""
+    hdrs = headers(**{"Idempotency-Key": "promo-retry-key"})
+    for _ in range(3):
+        resp = client.post("/v1/promotions", json=_promotion_body(), headers=hdrs)
+        assert resp.status_code == 201, resp.text
+
+    listed = client.get(
+        "/v1/promotions", params={"strategy_id": "IDEMP_S"}, headers=headers()
+    )
+    assert listed.status_code == 200
+    assert len(listed.json()) == 1
+
+
+def test_promotion_conflicting_replay_is_409(client):
+    hdrs = headers(**{"Idempotency-Key": "promo-key-2"})
+    r1 = client.post("/v1/promotions", json=_promotion_body(), headers=hdrs)
+    assert r1.status_code == 201, r1.text
+    r2 = client.post("/v1/promotions", json=_promotion_body(to_state="RETIRED"), headers=hdrs)
+    assert r2.status_code == 409
+    assert r2.json()["code"] == "idempotency_conflict"
+
+
+def test_promotion_without_a_key_records_every_call(client):
+    client.post("/v1/promotions", json=_promotion_body(), headers=headers())
+    client.post("/v1/promotions", json=_promotion_body(), headers=headers())
+    listed = client.get("/v1/promotions", params={"strategy_id": "IDEMP_S"}, headers=headers())
+    assert len(listed.json()) == 2
+
+
+def test_promotion_same_key_different_producers_do_not_collide(client):
+    hdrs = headers(**{"Idempotency-Key": "promo-shared-key"})
+    r1 = client.post("/v1/promotions", json=_promotion_body(producer="HSA"), headers=hdrs)
+    r2 = client.post("/v1/promotions", json=_promotion_body(producer="NEO"), headers=hdrs)
+    assert r1.status_code == 201 and r2.status_code == 201
+    assert r1.json()["transition_id"] != r2.json()["transition_id"]
+
+
+# --- health records ------------------------------------------------------
+
+
+def test_health_record_idempotent_replay_returns_same_record(client):
+    hdrs = headers(**{"Idempotency-Key": "health-key-1"})
+    r1 = client.post("/v1/health-records", json=_health_body(), headers=hdrs)
+    r2 = client.post("/v1/health-records", json=_health_body(), headers=hdrs)
+    assert r1.status_code == 201, r1.text
+    assert r2.status_code == 201, r2.text
+    assert r1.json()["health_id"] == r2.json()["health_id"]
+    assert r1.json() == r2.json()
+
+    listed = client.get("/v1/health-records", params={"strategy_id": "IDEMP_S"}, headers=headers())
+    assert len(listed.json()) == 1
+
+
+def test_health_record_conflicting_replay_is_409(client):
+    hdrs = headers(**{"Idempotency-Key": "health-key-2"})
+    r1 = client.post("/v1/health-records", json=_health_body(), headers=hdrs)
+    assert r1.status_code == 201, r1.text
+    r2 = client.post("/v1/health-records", json=_health_body(health_state="DEGRADED"), headers=hdrs)
+    assert r2.status_code == 409
+    assert r2.json()["code"] == "idempotency_conflict"
+
+
+def test_health_record_without_a_key_records_every_call(client):
+    client.post("/v1/health-records", json=_health_body(), headers=headers())
+    client.post("/v1/health-records", json=_health_body(), headers=headers())
+    listed = client.get("/v1/health-records", params={"strategy_id": "IDEMP_S"}, headers=headers())
+    assert len(listed.json()) == 2
+
+
+def test_health_record_same_key_different_producers_do_not_collide(client):
+    hdrs = headers(**{"Idempotency-Key": "health-shared-key"})
+    r1 = client.post("/v1/health-records", json=_health_body(producer="NEO"), headers=hdrs)
+    r2 = client.post("/v1/health-records", json=_health_body(producer="APOLLO"), headers=hdrs)
+    assert r1.status_code == 201 and r2.status_code == 201
+    assert r1.json()["health_id"] != r2.json()["health_id"]

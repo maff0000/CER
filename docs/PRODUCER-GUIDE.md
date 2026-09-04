@@ -71,7 +71,15 @@ sv = client.register_strategy_version(
 
 Both calls are safe to repeat with the *same* content (they return the
 existing record); repeating with *different* content for the same id
-raises `ImmutabilityError` (409) — see §9.
+raises `ImmutabilityError` (409) — see §9. "Same content" is compared
+field-for-field, and that includes `created_at`: if you don't pass
+`created_at` explicitly, each call is stamped with the server's current
+time, so an otherwise-identical retry that also omits `created_at` will be
+seen as *different* content and raise `ImmutabilityError` rather than
+returning the existing record. Most producers register a strategy/version
+once and never repeat the call, so this rarely matters in practice — but
+if you do need this call to be retry-safe, pass the same explicit
+`created_at` every time for a given `strategy_id`/`strategy_version`.
 
 ## 4. Experiment and run
 
@@ -105,9 +113,42 @@ client.close_run(run.run_id)  # defaults to status=CLOSED, ended_at=now
 
 ## 5. Idempotency keys — and why they're scoped to *your* producer name
 
-`create_run` and `append_evidence` accept an `idempotency_key`. A retry
-with the **same** producer, the **same** key, and an **identical** body
-returns the stored record — never a duplicate, never an error:
+An idempotency key makes a retry safe: replaying the same call with the
+same key and the same content returns the original record instead of
+creating a duplicate. Coverage differs by endpoint, and getting this wrong
+is exactly the kind of mistake that corrupts a history other teams read —
+so know where each call you make falls in the table below:
+
+| Endpoint | `CERClient` method | Key | What happens if you omit it |
+|---|---|---|---|
+| `POST /v1/evidence` | `append_evidence` | **Required** | The call is rejected (`contract_violation`, 400) — there is no key-less path |
+| `POST /v1/experiments/{id}/runs` | `create_run` | Optional, honoured when supplied | Every call creates a new run |
+| `POST /v1/experiments` | `create_experiment` | Optional, honoured when supplied | Every call creates a new experiment |
+| `POST /v1/promotions` | `record_promotion` | Optional, honoured when supplied | Every call records a new transition |
+| `POST /v1/health-records` | `record_health` | Optional, honoured when supplied | Every call records a new health observation |
+
+**On the optional endpoints, omitting the key does not make the call
+"unsafe" in some vague sense — it means a retry (a timeout you retried, a
+message your queue redelivered, a script you re-ran by hand) creates a
+second record.** For `create_experiment` and `record_health` that's
+usually just noise you can filter around. For `record_promotion` it's
+worse: promotion history is a lifecycle a human or NEO reads to answer
+"what state is this strategy in and when did it get there" — a
+duplicated transition (the same `DRAFT` -> `IMPLEMENTED` recorded twice)
+corrupts that history for every consumer of it, not just the caller who
+retried. If your promotion-recording code path can ever be retried
+(anything calling over HTTP can), pass an idempotency key.
+
+In every case, a retry with the **same** producer, the **same** key, and
+an **identical** body returns the stored record — never a duplicate,
+never an error. Server-assigned fields (creation timestamps CER stamps
+itself when you don't supply one) are excluded from that comparison, so a
+genuine retry is never a false conflict on account of time having passed;
+anything you author yourself — including `observed_at_utc` — is part of
+the compared content, so changing it between calls with the same key is a
+real conflict, not a retry.
+
+For example, `create_run`:
 
 ```python
 run1 = client.create_run(experiment.experiment_id, "HSA", idempotency_key="k1", environment="dev")
@@ -282,23 +323,35 @@ Attachment is one-way: once an artifact is attached to a `run_id` or
 `evidence_id`, attaching it to a *different* one raises `ImmutabilityError`
 (409) rather than silently relinking it.
 
-> **Known limitation** (reported to the PL, not a producer workaround):
-> `GET /v1/artifacts/{artifact_id}` currently does not reflect
-> `run_id`/`evidence_id` attachment made via `X-CER-Run-Id`/`X-CER-Evidence-Id`
-> headers or the `/attach` endpoint — it always shows the values from the
-> moment of registration. If you need to confirm an artifact's current
-> attachment, use `client.query_artifacts(run_id=...)` /
-> `client.query_artifacts(evidence_id=...)`, or the response of the
-> `register_artifact`/`attach_artifact` call itself — both of those are
-> correct.
+`GET /v1/artifacts/{artifact_id}` (`client.get_artifact_metadata`) is the
+authoritative view of an artifact's *current* lineage: it always reflects
+the latest `run_id`/`evidence_id` attachment, whether that attachment was
+made at registration (via `X-CER-Run-Id`/`X-CER-Evidence-Id`) or later via
+`/attach`.
+
+```python
+art2 = client.register_artifact(b"...", "report.pdf", content_type="application/pdf")
+assert client.get_artifact_metadata(art2.artifact_id).run_id is None  # not attached yet
+
+client.attach_artifact(art2.artifact_id, run_id=run.run_id, evidence_id=evidence.evidence_id)
+current = client.get_artifact_metadata(art2.artifact_id)
+assert current.run_id == run.run_id and current.evidence_id == evidence.evidence_id
+```
+
+`client.query_artifacts(run_id=...)` / `client.query_artifacts(evidence_id=...)`
+remain the right tool for a different question — not "what is this one
+artifact currently attached to" (use the GET above for that) but "find
+every artifact attached to this run/evidence record", e.g. to list all the
+files a given run produced.
 
 ## 9. Immutability rules — what can never be rewritten
 
 * **Strategies and strategy versions**: re-registering the same
   `strategy_id` / `(strategy_id, strategy_version)` with identical content
   is a no-op that returns the existing record; with *different* content it
-  raises `ImmutabilityError` (409). A strategy version is never edited in
-  place — a logic change is a new version.
+  raises `ImmutabilityError` (409) — see §3 for the `created_at` caveat on
+  what counts as "identical". A strategy version is never edited in place
+  — a logic change is a new version.
 * **Evidence**: once written, an evidence record's content never changes.
   A same-key-same-body retry returns the original; a same-key-different-body
   retry is `IdempotencyConflictError` (409); a direct clash on
@@ -363,11 +416,18 @@ one supporting `evidence_id`; every health record requires a reason and at
 least one supporting `evidence_id` — CER records observations, it does not
 accept an assertion with no evidence behind it.
 
+Both accept an optional `idempotency_key` (see §5) — pass one whenever
+this call could ever be retried. This matters most for
+`record_promotion`: promotion history is append-only and has no
+dedup other than the key, so a retried call with no key records the same
+transition twice.
+
 ```python
 client.record_promotion(
     "EMA_PULLBACK", "v1.0.0", "DRAFT", "IMPLEMENTED",
     authority="PL", producer="HSA",
     evidence_ids=[evidence.evidence_id], reason="code complete",
+    idempotency_key="hsa-2026-09-04-promote-implemented",
 )
 
 client.record_health(
@@ -375,6 +435,7 @@ client.record_health(
     reason="trigger rate within regime-conditioned expectation",
     evidence_ids=[evidence.evidence_id],
     win_rate=0.55, observed_trigger_rate=0.12, confidence=0.9,
+    idempotency_key="neo-2026-09-04-health-check",
 )
 ```
 
