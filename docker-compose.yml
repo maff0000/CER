@@ -1,0 +1,51 @@
+# Local/dev-host (dell-debian) compose file for the CER API.
+#
+# The image built here carries no dev/prod-specific behaviour — every
+# runtime difference (ports, log level, environment label) lives in this
+# file's `environment:`/`.env`, not in the Dockerfile, so the same image
+# is promotable to production unchanged (PID "Runtime / deployment").
+#
+# Metadata DB and artifact root are named volumes, not bind mounts, so
+# persisted records/artifacts survive `docker compose down && docker
+# compose up` (PID "persistent state must survive restart" /
+# "registered artifacts remain retrievable after restart"). They are
+# mounted at the exact paths the image pre-creates and chowns to the
+# non-root runtime user (see Dockerfile), so a fresh volume comes up
+# writable by that user without a startup fixup step.
+services:
+  cer:
+    build:
+      context: .
+    image: cer:latest
+    container_name: cer
+    restart: unless-stopped
+    ports:
+      - "${CER_HOST_PORT:-8000}:${CER_PORT:-8000}"
+    environment:
+      # Required — no image default exists for either (PID: no config or
+      # secrets baked into the image). Values here point at the named
+      # volumes mounted below.
+      CER_METADATA_DB_PATH: /var/lib/cer/metadata/cer.db
+      CER_ARTIFACT_ROOT: /var/lib/cer/artifacts
+      # Optional — safe defaults for a dell-debian dev run; override via
+      # a local .env (not committed) for anything environment-specific.
+      CER_HOST: 0.0.0.0
+      CER_PORT: ${CER_PORT:-8000}
+      CER_LOG_LEVEL: ${CER_LOG_LEVEL:-INFO}
+      CER_ENVIRONMENT: ${CER_ENVIRONMENT:-dev}
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - cer_metadata:/var/lib/cer/metadata
+      - cer_artifacts:/var/lib/cer/artifacts
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('CER_PORT', '8000') + '/health', timeout=2)"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+volumes:
+  cer_metadata:
+  cer_artifacts:

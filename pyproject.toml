@@ -17,6 +17,17 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+# cer.metadata.migrations loads these .sql files from disk at runtime
+# (see cer/metadata/migrations.py); setuptools does not include non-.py
+# files in a package by default, so without this a built wheel/sdist
+# silently omits them and SQLiteMetadataStore fails at first construction
+# ("migration schema directory ... does not exist") — only visible once
+# the package is actually installed from a built distribution rather than
+# run in-place from a checkout, which is exactly what running in a
+# container does.
+"cer.metadata" = ["schema/*.sql"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

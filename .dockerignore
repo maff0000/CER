@@ -1,0 +1,44 @@
+# Version control
+.git
+.gitignore
+
+# Docker build files themselves — not needed inside the image
+.dockerignore
+Dockerfile
+docker-compose.yml
+docker-compose.yaml
+
+# Tests — not shipped in the runtime image
+tests/
+tests/ops/
+
+# Docs / PID / briefs
+*.md
+docs/
+
+# Local/dev config and secrets — never enter the build context
+.env
+.env.*
+
+# Runtime state — deployment data, never baked into the image
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python / tooling caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Editor/OS cruft
+.vscode/
+.idea/
+.DS_Store
