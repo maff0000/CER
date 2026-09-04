@@ -265,6 +265,12 @@ class FakeMetadataStore:
         self._artifacts[artifact_id] = updated
         return updated
 
+    def get_artifact(self, artifact_id: str) -> ArtifactRecord:
+        try:
+            return self._artifacts[artifact_id]
+        except KeyError:
+            raise NotFoundError(f"artifact {artifact_id} not found") from None
+
     def query_artifacts(
         self,
         *,

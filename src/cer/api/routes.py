@@ -423,9 +423,22 @@ async def create_artifact(
 @api_router.get("/artifacts/{artifact_id}", response_model=ArtifactRecord)
 def get_artifact_metadata(
     artifact_id: str,
-    artifact_store: ArtifactStore = Depends(get_artifact_store),
+    metadata_store: MetadataStore = Depends(get_metadata_store),
 ) -> ArtifactRecord:
-    return artifact_store.stat(artifact_id)
+    """Return the authoritative ``ArtifactRecord`` for ``artifact_id``.
+
+    The metadata store — not the artifact store's ``stat()`` sidecar — is
+    authoritative for lineage (``evidence_id``/``run_id``): attachment can
+    happen after registration (see ``attach_artifact``), and only the
+    metadata store observes that. The filesystem sidecar is written once
+    at ``put()`` time and never updated, so reading it here would silently
+    report stale lineage forever after the first attach.
+
+    ``/download`` continues to be served from the artifact store
+    (``stat()`` + ``get()``, with its read-time checksum verification)
+    unchanged — that is the bytes path, and this is the metadata path.
+    """
+    return metadata_store.get_artifact(artifact_id)
 
 
 @api_router.get("/artifacts/{artifact_id}/download")

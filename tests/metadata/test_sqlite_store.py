@@ -830,6 +830,38 @@ def test_attach_artifact_unknown_ids_raise_not_found(store):
         store.attach_artifact(artifact.artifact_id, run_id="run_" + "0" * 32)
 
 
+def test_get_artifact_roundtrip_fidelity(store):
+    artifact = store.register_artifact(make_artifact())
+    fetched = store.get_artifact(artifact.artifact_id)
+    assert fetched == artifact
+
+
+def test_get_artifact_reflects_later_attachment(store):
+    """The whole point of get_artifact existing: it must be the
+    authoritative read, reflecting attachment made after registration --
+    not a stale copy of the record as first registered."""
+    experiment, run = _seeded_run(store)
+    evidence = store.append_evidence(
+        make_evidence(idempotency_key="ev-get-artifact", run_id=run.run_id, experiment_id=experiment.experiment_id)
+    )
+    artifact = store.register_artifact(make_artifact())
+
+    before = store.get_artifact(artifact.artifact_id)
+    assert before.evidence_id is None
+    assert before.run_id is None
+
+    store.attach_artifact(artifact.artifact_id, evidence_id=evidence.evidence_id, run_id=run.run_id)
+
+    after = store.get_artifact(artifact.artifact_id)
+    assert after.evidence_id == evidence.evidence_id
+    assert after.run_id == run.run_id
+
+
+def test_get_artifact_unknown_id_raises_not_found(store):
+    with pytest.raises(NotFoundError):
+        store.get_artifact("art_" + "0" * 32)
+
+
 # --- PromotionTransition / StrategyHealthRecord ---------------------------------------
 
 

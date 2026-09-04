@@ -156,3 +156,62 @@ def test_full_vertical_slice_over_http(client):
     resp = client.post(f"/v1/runs/{run_id}/close", json={"status": "CLOSED"}, headers=headers())
     assert resp.status_code == 200
     assert resp.json()["status"] == "CLOSED"
+
+
+def test_single_artifact_get_reflects_lineage_from_metadata_store(client):
+    """GET /v1/artifacts/{id} is served from the metadata store (the
+    authoritative source for evidence_id/run_id attachment), not the
+    artifact store's stat() sidecar -- see routes.get_artifact_metadata.
+    The fakes model that same authoritative-source split: FakeArtifactStore
+    keeps the record exactly as returned by put() (never attached),
+    FakeMetadataStore keeps the version register_artifact/attach_artifact
+    were given. This proves the API layer reads the right one."""
+    resp = client.post(
+        "/v1/evidence",
+        json={
+            "evidence_type": "BACKTEST",
+            "schema_version": 1,
+            "producer": "HSA",
+            "idempotency_key": "lineage-unit-1",
+        },
+        headers=headers(),
+    )
+    assert resp.status_code == 201, resp.text
+    evidence_id = resp.json()["evidence_id"]
+
+    # attachment supplied at registration
+    resp = client.post(
+        "/v1/artifacts",
+        content=b"unit-lineage-bytes",
+        headers=headers(**{"X-CER-Filename": "u.txt", "X-CER-Evidence-Id": evidence_id}),
+    )
+    assert resp.status_code == 201, resp.text
+    artifact_id = resp.json()["artifact_id"]
+
+    resp = client.get(f"/v1/artifacts/{artifact_id}", headers=headers())
+    assert resp.status_code == 200
+    assert resp.json()["evidence_id"] == evidence_id
+
+    # attachment applied later, via POST .../attach
+    resp = client.post(
+        "/v1/artifacts",
+        content=b"unit-lineage-bytes-2",
+        headers=headers(**{"X-CER-Filename": "u2.txt"}),
+    )
+    assert resp.status_code == 201, resp.text
+    artifact_id_2 = resp.json()["artifact_id"]
+    assert resp.json()["evidence_id"] is None
+
+    resp = client.get(f"/v1/artifacts/{artifact_id_2}", headers=headers())
+    assert resp.json()["evidence_id"] is None
+
+    resp = client.post(
+        f"/v1/artifacts/{artifact_id_2}/attach",
+        json={"evidence_id": evidence_id},
+        headers=headers(),
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = client.get(f"/v1/artifacts/{artifact_id_2}", headers=headers())
+    assert resp.status_code == 200
+    assert resp.json()["evidence_id"] == evidence_id

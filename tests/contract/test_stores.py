@@ -40,6 +40,7 @@ def test_metadata_store_is_runtime_checkable_protocol():
         "record_promotion",
         "record_health",
         "get_evidence",
+        "get_artifact",
         "query_evidence",
         "query_artifacts",
         "query_promotions",

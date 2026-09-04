@@ -68,6 +68,15 @@ def test_download_unknown_artifact_is_404(client):
     assert resp.json()["code"] == "not_found"
 
 
+def test_get_unknown_artifact_metadata_is_404(client):
+    """GET /v1/artifacts/{id} is served from the metadata store (see
+    routes.get_artifact_metadata) -- an id unknown to it must still 404,
+    the same as it did when served from the artifact store's sidecar."""
+    resp = client.get("/v1/artifacts/art_doesnotexist", headers=headers())
+    assert resp.status_code == 404
+    assert resp.json()["code"] == "not_found"
+
+
 # --- 400 contract violation family -----------------------------------------
 
 

@@ -771,6 +771,14 @@ class SQLiteMetadataStore:
 
             return self._row_to_artifact(row)
 
+    def get_artifact(self, artifact_id: str) -> ArtifactRecord:
+        row = self._conn.execute(
+            "SELECT * FROM artifacts WHERE artifact_id = ?", (artifact_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"artifact_id {artifact_id!r} does not exist")
+        return self._row_to_artifact(row)
+
     def query_artifacts(
         self,
         *,

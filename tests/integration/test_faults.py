@@ -395,21 +395,17 @@ def test_restart_preserves_evidence_and_artifact_bytes_through_the_api(tmp_path)
 
         resp = client2.get(f"/v1/artifacts/{artifact_id}", headers=headers())
         assert resp.status_code == 200
-        # Compare the fields the artifact store's own sidecar is
-        # authoritative for (identity, checksum, size, content-type,
-        # filename) -- NOT run_id/evidence_id here. See
-        # test_artifact_single_get_does_not_reflect_evidence_attachment
-        # below for a pre-existing (restart-independent) defect in this
-        # endpoint's run_id/evidence_id reporting, found by this suite and
-        # reported to the PL rather than fixed here.
-        after = resp.json()
-        for field in ("artifact_id", "sha256", "size_bytes", "content_type", "filename", "uri", "registered_at"):
-            assert after[field] == artifact_before[field], field
+        # The single-artifact GET is served from the metadata store (the
+        # authoritative source for lineage), so it must reflect everything
+        # -- identity, checksum, size, content-type, filename, AND the
+        # evidence_id attachment made before restart -- byte-for-byte, the
+        # same way the evidence restart check above does.
+        assert resp.json() == artifact_before
 
         # The evidence<->artifact linkage itself (owned by the metadata
         # store, not the artifact store's sidecar) does survive restart --
         # proven via the query endpoint, which is backed by the metadata
-        # store.
+        # store, and agrees with the single-artifact GET above.
         resp = client2.get("/v1/artifacts", params={"evidence_id": evidence_id}, headers=headers())
         assert artifact_id in [a["artifact_id"] for a in resp.json()]
 
@@ -437,40 +433,29 @@ def test_restart_preserves_evidence_and_artifact_bytes_through_the_api(tmp_path)
 
 
 # =====================================================================
-# Defect found by this suite (reported to the PL, not fixed here)
+# Lineage: single-artifact GET reflects evidence/run attachment
 # =====================================================================
 
 
-def test_artifact_single_get_does_not_reflect_evidence_run_attachment(client):
-    """DEFECT, found by this real-store suite, reported to the PL rather
-    than fixed here (out of this work item's scope; ``src/`` is not
-    touched by this dispatch).
-
-    ``GET /v1/artifacts/{artifact_id}`` (``routes.get_artifact_metadata``)
-    is served from ``artifact_store.stat()`` -- the filesystem sidecar
+def test_artifact_single_get_reflects_evidence_run_attachment(client):
+    """Fixed defect, found by this real-store suite: ``GET
+    /v1/artifacts/{artifact_id}`` (``routes.get_artifact_metadata``) used
+    to be served from ``artifact_store.stat()`` -- the filesystem sidecar
     JSON written once by ``FilesystemArtifactStore.put()`` at creation
-    time. It is never updated afterwards. But ``run_id``/``evidence_id``
-    attachment -- whether set via the ``X-CER-Run-Id``/``X-CER-Evidence-Id``
-    headers at creation, or via the separate ``POST
-    /v1/artifacts/{id}/attach`` endpoint -- is recorded only in the
-    metadata store's ``artifacts`` row, via
-    ``metadata_store.register_artifact``/``attach_artifact``.
+    time and never updated afterwards. ``run_id``/``evidence_id``
+    attachment is recorded only in the metadata store's ``artifacts`` row
+    (via ``metadata_store.register_artifact``/``attach_artifact``), so the
+    single-artifact-by-id endpoint permanently reported stale linkage
+    while ``GET /v1/artifacts?evidence_id=``/``?run_id=`` and ``POST
+    .../attach``'s own response (both backed by the metadata store)
+    reported it correctly. Two endpoints of the same contract disagreed
+    about the same artifact's linkage.
 
-    The result: the single-artifact-by-id endpoint *always* reports
-    ``run_id``/``evidence_id`` as whatever they were at the moment of
-    ``put()`` (``None``, unless a future refactor changes that) --
-    regardless of any attachment made before or after. Meanwhile
-    ``GET /v1/artifacts?run_id=``/``?evidence_id=`` (``query_artifacts``,
-    backed by the metadata store) and ``POST .../attach``'s own response
-    (also backed by the metadata store) report the attachment correctly.
-    Two endpoints of the same contract disagree about the same artifact's
-    linkage -- exactly the class of bug this suite exists to catch,
-    invisible to any component suite that fakes one store independently of
-    the other.
-
-    This test pins today's actual (defective) behaviour so it is visible
-    and tracked, not silently reintroduced or silently "fixed" by
-    accident. It is NOT a statement that this behaviour is correct.
+    ``get_artifact_metadata`` now reads the authoritative ``ArtifactRecord``
+    from the metadata store instead, so it reflects attachment made either
+    at registration (``X-CER-Run-Id``/``X-CER-Evidence-Id`` headers) or
+    later (``POST /v1/artifacts/{id}/attach``). This test proves both
+    paths.
     """
     resp = client.post(
         "/v1/evidence",
@@ -478,16 +463,17 @@ def test_artifact_single_get_does_not_reflect_evidence_run_attachment(client):
             "evidence_type": "BACKTEST",
             "schema_version": 1,
             "producer": "HSA",
-            "idempotency_key": "defect-artifact-attach-1",
+            "idempotency_key": "lineage-artifact-attach-1",
         },
         headers=headers(),
     )
     assert resp.status_code == 201, resp.text
     evidence_id = resp.json()["evidence_id"]
 
+    # --- path 1: attachment supplied at registration (header) -----------
     resp = client.post(
         "/v1/artifacts",
-        content=b"defect-repro-bytes",
+        content=b"lineage-repro-bytes-at-registration",
         headers=headers(**{"X-CER-Filename": "f.txt", "X-CER-Evidence-Id": evidence_id}),
     )
     assert resp.status_code == 201, resp.text
@@ -496,13 +482,157 @@ def test_artifact_single_get_does_not_reflect_evidence_run_attachment(client):
     # The creation response itself correctly reflects the attachment...
     assert created["evidence_id"] == evidence_id
 
-    # ...but the single-item GET does not.
+    # ...and now the single-item GET agrees with it.
     single_get = client.get(f"/v1/artifacts/{artifact_id}", headers=headers())
     assert single_get.status_code == 200
-    assert single_get.json()["evidence_id"] is None  # defect: should be evidence_id
+    assert single_get.json()["evidence_id"] == evidence_id
 
-    # ...while the query endpoint (backed by the metadata store, same as
-    # the creation response) reports it correctly, proving the two
-    # endpoints disagree about the same artifact.
+    # ...and so does the query endpoint -- all three views now agree.
     queried = client.get("/v1/artifacts", params={"evidence_id": evidence_id}, headers=headers())
     assert artifact_id in [a["artifact_id"] for a in queried.json()]
+
+    # --- path 2: attachment applied later, via POST .../attach ----------
+    resp = client.post(
+        "/v1/experiments",
+        json={"objective": "lineage attach-later", "producer": "HSA"},
+        headers=headers(),
+    )
+    assert resp.status_code == 201, resp.text
+    experiment_id = resp.json()["experiment_id"]
+    resp = client.post(
+        f"/v1/experiments/{experiment_id}/runs",
+        json={"producer": "HSA"},
+        headers=headers(),
+    )
+    assert resp.status_code == 201, resp.text
+    run_id = resp.json()["run_id"]
+
+    resp = client.post(
+        "/v1/artifacts",
+        content=b"lineage-repro-bytes-unattached",
+        headers=headers(**{"X-CER-Filename": "g.txt"}),
+    )
+    assert resp.status_code == 201, resp.text
+    unattached_artifact_id = resp.json()["artifact_id"]
+    assert resp.json()["run_id"] is None
+
+    # Before attaching, the single GET correctly reports no linkage yet.
+    before_attach = client.get(f"/v1/artifacts/{unattached_artifact_id}", headers=headers())
+    assert before_attach.status_code == 200
+    assert before_attach.json()["run_id"] is None
+
+    resp = client.post(
+        f"/v1/artifacts/{unattached_artifact_id}/attach",
+        json={"run_id": run_id},
+        headers=headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["run_id"] == run_id
+
+    # The single-item GET now reflects the later attachment too.
+    after_attach = client.get(f"/v1/artifacts/{unattached_artifact_id}", headers=headers())
+    assert after_attach.status_code == 200
+    assert after_attach.json()["run_id"] == run_id
+
+
+def test_three_views_of_artifact_lineage_agree(client):
+    """The registration response, the single-item GET, and the query-by-
+    evidence_id endpoint must all report the same lineage for the same
+    artifact -- the exact three-way disagreement this defect produced."""
+    resp = client.post(
+        "/v1/evidence",
+        json={
+            "evidence_type": "BACKTEST",
+            "schema_version": 1,
+            "producer": "HSA",
+            "idempotency_key": "lineage-three-views-1",
+        },
+        headers=headers(),
+    )
+    assert resp.status_code == 201, resp.text
+    evidence_id = resp.json()["evidence_id"]
+
+    resp = client.post(
+        "/v1/experiments",
+        json={"objective": "lineage three views", "producer": "HSA"},
+        headers=headers(),
+    )
+    experiment_id = resp.json()["experiment_id"]
+    resp = client.post(
+        f"/v1/experiments/{experiment_id}/runs",
+        json={"producer": "HSA"},
+        headers=headers(),
+    )
+    run_id = resp.json()["run_id"]
+
+    resp = client.post(
+        "/v1/artifacts",
+        content=b"three-views-bytes",
+        headers=headers(**{
+            "X-CER-Filename": "three_views.txt",
+            "X-CER-Evidence-Id": evidence_id,
+            "X-CER-Run-Id": run_id,
+        }),
+    )
+    assert resp.status_code == 201, resp.text
+    created = resp.json()
+    artifact_id = created["artifact_id"]
+    assert created["evidence_id"] == evidence_id
+    assert created["run_id"] == run_id
+
+    single_get = client.get(f"/v1/artifacts/{artifact_id}", headers=headers())
+    assert single_get.status_code == 200
+
+    queried = client.get("/v1/artifacts", params={"evidence_id": evidence_id}, headers=headers())
+    assert queried.status_code == 200
+    [queried_record] = [a for a in queried.json() if a["artifact_id"] == artifact_id]
+
+    for record in (created, single_get.json(), queried_record):
+        assert record["evidence_id"] == evidence_id
+        assert record["run_id"] == run_id
+
+
+# =====================================================================
+# Download (bytes path) integrity -- unaffected by the lineage fix
+# =====================================================================
+
+
+def test_download_still_byte_identical_and_fails_loudly_on_corrupted_blob(client, artifact_store):
+    """The fix to ``GET /v1/artifacts/{id}`` changes only the metadata
+    path. ``/download`` must still be served from the artifact store,
+    still return byte-identical content, and still refuse to serve a
+    corrupted blob -- proving the integrity path was not regressed."""
+    payload = b"download-integrity-check-bytes " + b"y" * 500
+    expected_sha = hashlib.sha256(payload).hexdigest()
+
+    resp = client.post(
+        "/v1/artifacts",
+        content=payload,
+        headers=headers(**{"X-CER-Filename": "integrity.bin"}),
+    )
+    assert resp.status_code == 201, resp.text
+    artifact_id = resp.json()["artifact_id"]
+    assert resp.json()["sha256"] == expected_sha
+
+    resp = client.get(f"/v1/artifacts/{artifact_id}/download", headers=headers())
+    assert resp.status_code == 200
+    assert resp.content == payload  # byte-identical
+    assert hashlib.sha256(resp.content).hexdigest() == expected_sha
+
+    # Now corrupt the blob on disk directly (bypassing the API entirely --
+    # the same mechanism test_checksum_mismatch_fails_loudly_and_stores_nothing
+    # uses to reach into the real filesystem store).
+    blob_path = artifact_store.blobs_dir / expected_sha[0:2] / expected_sha[2:4] / expected_sha
+    assert blob_path.is_file()
+    blob_path.write_bytes(b"corrupted-on-disk" + payload)
+
+    # The metadata path (this work item's fix) is unaffected by blob
+    # corruption -- it never reads bytes.
+    resp = client.get(f"/v1/artifacts/{artifact_id}", headers=headers())
+    assert resp.status_code == 200
+    assert resp.json()["sha256"] == expected_sha
+
+    # But /download must still refuse to serve the corrupted bytes.
+    resp = client.get(f"/v1/artifacts/{artifact_id}/download", headers=headers())
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "checksum_mismatch"

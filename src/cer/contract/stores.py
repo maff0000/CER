@@ -152,6 +152,14 @@ class MetadataStore(Protocol):
         """Raises ``NotFoundError`` if ``evidence_id`` is unknown."""
         ...
 
+    def get_artifact(self, artifact_id: str) -> ArtifactRecord:
+        """Return the authoritative ``ArtifactRecord`` for ``artifact_id``,
+        including any evidence/run attachment recorded since registration.
+
+        Raises ``NotFoundError`` if ``artifact_id`` is unknown.
+        """
+        ...
+
     def query_evidence(
         self,
         *,
