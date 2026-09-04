@@ -378,6 +378,36 @@ def test_create_run_idempotency_key_is_scoped_per_producer(store):
     assert hsa_replay.run_id == hsa_run.run_id
 
 
+def test_create_run_replay_with_differing_started_at_is_not_a_conflict(store):
+    """Regression test: started_at is a server-assignable record-creation
+    timestamp -- when a caller omits it, the API layer fills it with
+    wall-clock time on every attempt, so a byte-identical HTTP retry has a
+    different started_at on each try. That must still be recognised as a
+    replay, not rejected as a conflict.
+    """
+    experiment = store.create_experiment(make_experiment())
+    key = "run-retry-varying-started-at"
+
+    first = store.create_run(
+        make_run(experiment.experiment_id, started_at=_now(offset_seconds=1)),
+        idempotency_key=key,
+    )
+    second = store.create_run(
+        make_run(experiment.experiment_id, started_at=_now(offset_seconds=99)),
+        idempotency_key=key,
+    )
+
+    assert second.run_id == first.run_id
+    assert second == first  # returns the stored record, including its original started_at
+
+    conn = sqlite3.connect(str(store._db_path))
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM runs WHERE idempotency_key = ?", (key,)).fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1
+
+
 def test_create_run_concurrent_replay_creates_exactly_one_row(store):
     experiment = store.create_experiment(make_experiment())
     key = "run-idem-concurrent"
@@ -574,6 +604,102 @@ def test_append_evidence_idempotency_key_is_scoped_per_producer(store):
         )
     )
     assert hsa_replay.evidence_id == hsa_evidence.evidence_id
+
+
+def test_append_evidence_replay_with_differing_created_at_utc_is_not_a_conflict(store):
+    """Regression test: created_at_utc is a server-assignable record-creation
+    timestamp -- when a caller omits it, the API layer fills it with
+    wall-clock time on every attempt, so a byte-identical HTTP retry has a
+    different created_at_utc on each try. That must still be recognised as
+    a replay, not rejected as a conflict.
+    """
+    experiment, run = _seeded_run(store)
+    key = "ev-retry-varying-created-at"
+
+    first = store.append_evidence(
+        make_evidence(
+            idempotency_key=key,
+            run_id=run.run_id,
+            experiment_id=experiment.experiment_id,
+            created_at_utc=_now(offset_seconds=1),
+        )
+    )
+    second = store.append_evidence(
+        make_evidence(
+            idempotency_key=key,
+            run_id=run.run_id,
+            experiment_id=experiment.experiment_id,
+            created_at_utc=_now(offset_seconds=99),
+        )
+    )
+
+    assert second.evidence_id == first.evidence_id
+    assert second == first  # returns the stored record, including its original created_at_utc
+
+    conn = sqlite3.connect(str(store._db_path))
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM evidence WHERE idempotency_key = ?", (key,)).fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1
+
+
+def test_append_evidence_replay_with_differing_observed_at_utc_still_conflicts(store):
+    """observed_at_utc is caller-authored and semantically meaningful (when
+    the thing was observed, not when the row was created) -- unlike
+    created_at_utc, it must stay part of the fingerprint. A producer that
+    reuses a key while genuinely changing the observation time must still
+    get a loud IdempotencyConflictError.
+    """
+    experiment, run = _seeded_run(store)
+    key = "ev-retry-varying-observed-at"
+
+    store.append_evidence(
+        make_evidence(
+            idempotency_key=key,
+            run_id=run.run_id,
+            experiment_id=experiment.experiment_id,
+            observed_at_utc=_now(offset_seconds=1),
+        )
+    )
+    with pytest.raises(IdempotencyConflictError):
+        store.append_evidence(
+            make_evidence(
+                idempotency_key=key,
+                run_id=run.run_id,
+                experiment_id=experiment.experiment_id,
+                observed_at_utc=_now(offset_seconds=2),
+            )
+        )
+
+
+def test_append_evidence_replay_with_materially_different_body_still_conflicts(store):
+    """Sanity check that excluding the creation timestamp did not
+    accidentally widen the exclusion to genuine content: a materially
+    different body under the same producer/key must still raise.
+    """
+    experiment, run = _seeded_run(store)
+    key = "ev-retry-different-environment"
+
+    store.append_evidence(
+        make_evidence(
+            idempotency_key=key,
+            run_id=run.run_id,
+            experiment_id=experiment.experiment_id,
+            environment="dev",
+            metrics={"sharpe": 1.0},
+        )
+    )
+    with pytest.raises(IdempotencyConflictError):
+        store.append_evidence(
+            make_evidence(
+                idempotency_key=key,
+                run_id=run.run_id,
+                experiment_id=experiment.experiment_id,
+                environment="prod",
+                metrics={"sharpe": 2.0},
+            )
+        )
 
 
 def test_append_evidence_rewrite_under_existing_evidence_id_raises_immutability(store):

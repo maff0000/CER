@@ -29,10 +29,27 @@ the docstrings below), fields that are purely derived/recomputed by the
 pydantic model itself are excluded (comparing them would be redundant,
 never additionally informative), and an artifact's ``run_id``/
 ``evidence_id`` are excluded because ``attach_artifact`` is the one
-sanctioned path for setting or changing them, not re-registration.
-Every other field -- including timestamps -- is part of the fingerprint:
-a genuine retry is expected to resubmit the exact payload it already
-built, not reconstruct one with a new wall-clock timestamp.
+sanctioned path for setting or changing them, not re-registration. Every
+other content field is part of the fingerprint by default -- but see the
+next section for the one deliberate carve-out among timestamps.
+
+Server-assigned creation timestamps vs. caller-authored semantic fields
+--------------------------------------------------------------------------
+``started_at`` (``create_run``) and ``created_at_utc`` (``append_evidence``)
+are excluded from the fingerprint. These are record-creation timestamps: a
+caller that omits them lets the API layer fill them with wall-clock time
+at request-handling, which is regenerated on *every* attempt -- so a
+byte-identical retry through HTTP would otherwise hash differently on
+this field alone and could never be recognised as a replay, defeating
+idempotency for exactly the callers who rely on it most (ones that don't
+pin their own timestamp). Server-assigned creation timestamps are
+excluded from the fingerprint because the service generates them per
+attempt; caller-authored semantic fields, including ``observed_at_utc``,
+remain part of the content. ``observed_at_utc`` is deliberately *kept in*
+the fingerprint: it is when the producer says the thing was observed, not
+when the row happened to be created, and a producer that reuses a key
+while genuinely changing the observation time must still get a loud
+``IdempotencyConflictError``, not a silently-returned stale record.
 
 Idempotency keys are scoped to the producer
 --------------------------------------------
@@ -92,10 +109,18 @@ _DEFAULT_BUSY_TIMEOUT_MS = 5_000
 #: attempt (while reusing the same idempotency_key) is still recognised as
 #: a replay. provenance_completeness/missing_provenance are derived purely
 #: from the other fields, so including them adds no discriminating power.
-_RUN_FP_EXCLUDE = {"run_id", "provenance_completeness", "missing_provenance"}
+#: started_at is the record-creation timestamp -- see the module
+#: docstring's "server-assigned creation timestamps" section for why it is
+#: excluded too: a caller that omits it lets the API layer fill it with
+#: wall-clock time at request-handling, which differs on every attempt and
+#: would otherwise make every HTTP retry hash differently.
+_RUN_FP_EXCLUDE = {"run_id", "started_at", "provenance_completeness", "missing_provenance"}
 
-#: Same reasoning as _RUN_FP_EXCLUDE, for EvidenceRecord/evidence_id.
-_EVIDENCE_FP_EXCLUDE = {"evidence_id", "provenance_completeness", "missing_provenance"}
+#: Same reasoning as _RUN_FP_EXCLUDE, for EvidenceRecord/evidence_id, with
+#: created_at_utc playing the role started_at plays for Run. Note
+#: observed_at_utc is deliberately NOT excluded -- see the module
+#: docstring.
+_EVIDENCE_FP_EXCLUDE = {"evidence_id", "created_at_utc", "provenance_completeness", "missing_provenance"}
 
 #: artifact_id is the record's own identity (the lookup key, so trivially
 #: equal on both sides already). run_id/evidence_id are excluded because
