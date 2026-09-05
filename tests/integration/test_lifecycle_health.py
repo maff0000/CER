@@ -227,4 +227,8 @@ def test_health_record_requires_evidence_backed_reason(client):
         },
         headers=headers(),
     )
-    assert resp.status_code in (400, 422)
+    # Pinned, not "400 or 422": the status and the stable error ``code``
+    # are the contract a producer codes against, and a range that accepts
+    # either would keep passing if the rejection changed shape.
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == "validation_error"

@@ -757,14 +757,130 @@ def test_unknown_extra_field_fails_loudly(client):
     assert resp.json()["code"] == "validation_error"
 
 
+#: The four malformed-provenance submissions the PID names, each with the
+#: exact status and stable error ``code`` it must be rejected with. These
+#: mirror the four "fails loudly" tests above (which each keep their own
+#: case-specific reasoning); this table is what lets the "never creates a
+#: record" test below issue the same four submissions itself instead of
+#: assuming those tests ran first.
+MALFORMED_EVIDENCE_SUBMISSIONS: tuple[tuple[str, dict, int, str], ...] = (
+    (
+        "unknown evidence type",
+        {"evidence_type": "NOT_A_REAL_TYPE", "schema_version": 1},
+        400,
+        "unknown_evidence_type",
+    ),
+    (
+        "incompatible schema_version",
+        {"evidence_type": "BACKTEST", "schema_version": 999},
+        400,
+        "incompatible_schema_version",
+    ),
+    (
+        "naive (timezone-less) datetime",
+        # No Z, no offset -- CER never guesses a timezone on a caller's behalf.
+        {"evidence_type": "BACKTEST", "schema_version": 1, "observed_at_utc": "2026-01-01T00:00:00"},
+        400,
+        "validation_error",
+    ),
+    (
+        "unknown extra field",
+        {"evidence_type": "BACKTEST", "schema_version": 1, "totally_made_up_field": "nope"},
+        422,
+        "validation_error",
+    ),
+)
+
+
+def _evidence_snapshot(client) -> tuple[set[str], set[str]]:
+    """Return ``(evidence_ids, idempotency_keys)`` currently in the registry.
+
+    Reads through the public query endpoint (the same view a producer
+    gets), with an explicit high limit so the comparison can never be a
+    false pass caused by pagination hiding a newly created record.
+    """
+    resp = client.get("/v1/evidence", params={"limit": 1000}, headers=headers())
+    assert resp.status_code == 200, resp.text
+    records = resp.json()
+    return (
+        {e["evidence_id"] for e in records},
+        {e["idempotency_key"] for e in records},
+    )
+
+
 def test_malformed_provenance_never_creates_a_record(client):
-    """None of the malformed-provenance rejections above should leave a
-    partial record behind -- confirm the rejected idempotency keys never
-    became real evidence."""
-    for key in ("fault-unknown-type", "fault-bad-schema", "fault-naive-dt", "fault-extra-field"):
-        resp = client.get("/v1/evidence", params={}, headers=headers())
-        ids = {e["idempotency_key"] for e in resp.json()}
-        assert key not in ids
+    """Every malformed-provenance rejection must leave the evidence
+    collection byte-for-byte as it found it.
+
+    This test issues the malformed submissions *itself* rather than
+    depending on the tests above having run, and it compares a real
+    before/after snapshot rather than asserting absence from a database it
+    assumes is empty. Both matter: the ``client`` fixture is
+    function-scoped, so an "assert these keys are missing" check against a
+    fresh registry passes trivially -- it would pass unchanged against an
+    implementation that stored every single malformed submission.
+
+    A valid record is written first, so "unchanged" means "unchanged from
+    a non-empty collection" and the query path is proven to be capable of
+    returning records at all. Without that, an endpoint that always
+    returned ``[]`` would also satisfy this test.
+    """
+    seeded = client.post(
+        "/v1/evidence",
+        json={
+            "evidence_type": "BACKTEST",
+            "schema_version": 1,
+            "producer": "HSA",
+            "idempotency_key": "malformed-guard-valid-record",
+            "verdict": "PROMISING",
+        },
+        headers=headers(),
+    )
+    assert seeded.status_code == 201, seeded.text
+    seeded_id = seeded.json()["evidence_id"]
+
+    ids_before, keys_before = _evidence_snapshot(client)
+    # The guard on the guard: the comparison below is only meaningful if
+    # the collection is genuinely non-empty and the query really returns
+    # what was written.
+    assert seeded_id in ids_before
+    assert "malformed-guard-valid-record" in keys_before
+
+    rejected_keys = set()
+    for label, fields, expected_status, expected_code in MALFORMED_EVIDENCE_SUBMISSIONS:
+        key = f"malformed-guard-{label.split()[0]}"
+        rejected_keys.add(key)
+        body = {"producer": "HSA", "idempotency_key": key}
+        body.update(fields)
+
+        resp = client.post("/v1/evidence", json=body, headers=headers())
+
+        assert resp.status_code == expected_status, (
+            f"{label}: expected {expected_status}, got {resp.status_code}: {resp.text}"
+        )
+        assert resp.json()["code"] == expected_code, f"{label}: {resp.text}"
+
+    ids_after, keys_after = _evidence_snapshot(client)
+
+    # The whole point: nothing was created, nothing was removed, nothing
+    # was rewritten into something else.
+    assert ids_after == ids_before, (
+        "a rejected malformed submission changed the evidence collection: "
+        f"added {ids_after - ids_before}, removed {ids_before - ids_after}"
+    )
+    assert keys_after == keys_before
+
+    # And specifically: not one of the rejected keys became real evidence.
+    assert rejected_keys.isdisjoint(keys_after), (
+        f"rejected submissions were stored: {rejected_keys & keys_after}"
+    )
+
+    # The valid record written before the malformed burst is still intact
+    # and still individually retrievable -- a rejection must not damage
+    # neighbouring records either.
+    still_there = client.get(f"/v1/evidence/{seeded_id}", headers=headers())
+    assert still_there.status_code == 200, still_there.text
+    assert still_there.json() == seeded.json()
 
 
 # =====================================================================
@@ -802,6 +918,48 @@ def test_checksum_mismatch_fails_loudly_and_stores_nothing(client, artifact_stor
     real_digest = hashlib.sha256(payload).hexdigest()
     real_blob_path = artifact_store.blobs_dir / real_digest[0:2] / real_digest[2:4] / real_digest
     assert not real_blob_path.exists()
+
+
+def test_blob_collision_409_does_not_hand_the_producer_a_filesystem_path(client, artifact_store):
+    """A blob collision surfaces as a 409 the producer must act on -- but
+    the producer guide's "do not touch storage internals" rule cuts both
+    ways: the API must not put an absolute on-disk path in the response
+    body either. The response identifies the conflict by sha256 digest;
+    the path goes to the server-side log.
+    """
+    payload = b"bytes whose canonical blob path is already occupied"
+    digest = hashlib.sha256(payload).hexdigest()
+
+    # Plant differing content at this digest's canonical path, outside the
+    # API entirely (on-disk corruption or a genuine hash collision) --
+    # the same reach-into-the-real-store mechanism the checksum and
+    # download-integrity tests above use.
+    blob_path = artifact_store.blobs_dir / digest[0:2] / digest[2:4] / digest
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    blob_path.write_bytes(b"entirely different content under the same digest")
+
+    resp = client.post(
+        "/v1/artifacts",
+        content=payload,
+        headers=headers(**{"Content-Type": "text/plain", "X-CER-Filename": "collide.bin"}),
+    )
+
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert body["code"] == "immutability_violation"
+
+    # Enough to identify exactly which artifact conflicted...
+    assert digest in body["message"]
+
+    # ...and nothing about where CER keeps its bytes.
+    assert str(artifact_store.root) not in resp.text
+    assert str(blob_path) not in resp.text
+    assert "/" not in body["message"], (
+        f"the 409 body leaked a filesystem path: {body['message']!r}"
+    )
+
+    # The planted content is untouched -- refused, not overwritten.
+    assert blob_path.read_bytes() == b"entirely different content under the same digest"
 
 
 # =====================================================================

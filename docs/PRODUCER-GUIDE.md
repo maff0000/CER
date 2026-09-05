@@ -519,10 +519,11 @@ matching exception from `cer.contract.errors` for each code below.
 | `internal_error` | 500 | An unexpected server-side failure | Retriable, but report it — this is not an expected error path |
 | `cer_client_error` | n/a (client-side) | `CERClient` received a `code` it doesn't recognise (e.g. a newer server) or a malformed error body | Upgrade your `cer` client |
 
-## 11. Queries
+## 11. Queries — and what is *not* readable back
 
-Every append-only collection is queryable, filtered and paginated
-(`limit`/`offset` where applicable):
+Four of CER's seven append-only collections are queryable, filtered and
+paginated (`limit`/`offset` where applicable): **evidence**, **artifacts**,
+**promotion transitions** and **strategy health records**.
 
 ```python
 client.query_evidence(strategy_id="EMA_PULLBACK", strategy_version="v1.0.0")
@@ -533,6 +534,58 @@ client.query_artifacts(run_id=run.run_id)
 client.query_promotions(strategy_id="EMA_PULLBACK")
 client.query_health(strategy_id="EMA_PULLBACK")
 ```
+
+Evidence and artifacts additionally have a single-record fetch by id:
+
+```python
+client.get_evidence(evidence.evidence_id)
+client.get_artifact_metadata(artifact.artifact_id)
+client.download_artifact(artifact.artifact_id)   # the bytes
+```
+
+### What v1 does not let you read back
+
+Plan for this before you design a producer around it. The remaining three
+append-only collections have **no list endpoint at all**, and runs have no
+read endpoint either:
+
+| You might expect | v1 reality |
+| --- | --- |
+| `GET /v1/runs/{run_id}` | does not exist |
+| `GET /v1/experiments/{experiment_id}` | does not exist |
+| a list of strategies | does not exist |
+| a list of strategy versions | does not exist |
+| a list of experiments | does not exist |
+| a list of runs | does not exist |
+
+So strategies, strategy versions, experiments and runs are **write-only
+through the contract**: you get the full record in the `201` response when
+you create it, and after that CER offers no way to ask for it again by id.
+A run's computed `provenance_completeness` / `missing_provenance` is
+therefore visible only in that creation response.
+
+**Capture what you create.** Keep the `strategy_id`, `strategy_version`,
+`experiment_id` and `run_id` your own process generated — CER will not hand
+them back to you by search.
+
+### The one workaround, stated honestly
+
+Because create is idempotent on `(your producer, idempotency_key)`,
+*replaying the original call with the original key returns the stored
+record* — the same body the first `201` returned, not a new record:
+
+```python
+# Same producer, same idempotency_key, same body as the original call.
+run = client.create_run(experiment_id, producer="HSA", idempotency_key="run-2026-01-05-a")
+# -> 201 with the ORIGINAL stored Run, including provenance_completeness
+```
+
+This is a retry path being reused as a read, and it only works if you
+supplied an idempotency key in the first place and still know it, the
+experiment id, and the exact original body. A materially different body
+under the same key is a `409 idempotency_conflict`, not a read. Treat it as
+a recovery trick, not a query API — CER v1 has no query API for these
+collections.
 
 ## 12. Promotion and health records (usually not the historical-evidence producer)
 

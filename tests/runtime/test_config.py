@@ -134,27 +134,51 @@ def test_looks_secret_classifies_field_names_by_marker():
     assert not _looks_secret("metadata_db_path")
 
 
-def test_redacted_masks_a_secret_shaped_field_on_a_settings_like_dataclass():
-    # Settings itself has no secret-shaped field; prove the masking wired
-    # into redacted() actually fires by exercising it on a small dataclass
-    # that reuses cer.runtime.config's own masking helpers.
+def test_redacted_masks_a_secret_shaped_field_through_settings_own_method():
+    """The masking branch of the REAL ``Settings.redacted()``.
+
+    No field on ``Settings`` is secret-shaped by name today, so on a plain
+    ``Settings`` instance that branch never executes and the test above
+    only covers the pass-through half.
+
+    This exercises it on a *subclass* that adds a secret-shaped field.
+    ``redacted()`` is inherited, not reimplemented, so the method under
+    test is genuinely ``Settings.redacted`` -- and because it is
+    ``dataclasses.fields``-driven rather than a hardcoded field list, it
+    sees the added field. That is precisely the situation the method's own
+    docstring promises to handle ("keeps working if a secret-shaped field
+    is ever added").
+
+    An earlier version of this test copied ``redacted()``'s body into a
+    standalone dataclass, so a bug introduced in ``Settings.redacted``
+    itself -- masking nothing, or masking everything -- could not fail it.
+    """
     from dataclasses import dataclass, fields
 
-    from cer.runtime.config import _looks_secret, _REDACTED_VALUE
+    from cer.runtime.config import _REDACTED_VALUE
 
     @dataclass(frozen=True)
-    class _WithSecret:
-        api_key: str
-        host: str
+    class _SettingsWithSecret(Settings):
+        api_key: str = "super-secret-value"
 
-        def redacted(self) -> dict:
-            return {
-                f.name: _REDACTED_VALUE if _looks_secret(f.name) else getattr(self, f.name)
-                for f in fields(self)
-            }
+    base = load_settings(REQUIRED_ENV)
+    settings = _SettingsWithSecret(**{f.name: getattr(base, f.name) for f in fields(base)})
 
-    obj = _WithSecret(api_key="super-secret-value", host="localhost")
-    redacted = obj.redacted()
+    # The real method, not a copy of it.
+    assert type(settings).redacted is Settings.redacted
+    redacted = settings.redacted()
+
+    # The secret-shaped field is masked...
     assert redacted["api_key"] == _REDACTED_VALUE
-    assert redacted["host"] == "localhost"
     assert "super-secret-value" not in str(redacted)
+
+    # ...and the same call leaves every non-secret field untouched, which
+    # is what distinguishes real name-driven masking from "mask
+    # everything".
+    assert redacted["host"] == settings.host
+    assert redacted["port"] == settings.port
+    assert redacted["metadata_db_path"] == settings.metadata_db_path
+    assert redacted["artifact_root"] == settings.artifact_root
+
+    # Every field is reported, none dropped.
+    assert set(redacted) == {f.name for f in fields(settings)}

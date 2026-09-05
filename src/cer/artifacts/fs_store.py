@@ -51,6 +51,11 @@ content that differs under the same digest path (on-disk corruption, or a
 hash collision) raises :class:`~cer.contract.errors.ImmutabilityError`
 rather than silently overwriting — this is the literal mechanism behind
 the PID's "prevent silent overwrite of immutable artifacts" requirement.
+That error names the colliding ``sha256`` digest and nothing else: it
+reaches the producer as a 409 response body, and the absolute on-disk blob
+path is storage internals a producer is explicitly told not to depend on.
+The path (and the two content lengths) go to the log instead, on a record
+tagged ``EVENT_BLOB_DIGEST_COLLISION``.
 Sidecars never collide in practice (``artifact_id`` is a fresh UUID4 per
 call) so no such check is needed for them.
 
@@ -138,6 +143,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -154,6 +160,15 @@ from cer.contract.errors import (
 from cer.contract.identity import new_artifact_id
 from cer.contract.models import ArtifactRecord
 from cer.runtime.clock import isoformat_utc, utcnow
+
+logger = logging.getLogger("cer.artifacts.fs_store")
+
+#: Stable ``event`` value on the blob-collision log record, so an operator
+#: can grep or alert on it without matching free text. The operational
+#: detail (including the absolute on-disk path) lives on this record —
+#: deliberately not in the API response, which must not hand a producer
+#: storage internals it is told not to depend on.
+EVENT_BLOB_DIGEST_COLLISION = "artifact_store.blob_digest_collision"
 
 __all__ = ["FilesystemArtifactStore"]
 
@@ -327,10 +342,25 @@ class FilesystemArtifactStore:
                     ) from exc
                 if existing == data:
                     return
+                # Full operational detail — including the absolute on-disk
+                # path an operator needs to investigate — goes to the log.
+                logger.error(
+                    "blob digest collision: an existing blob for this digest "
+                    "holds different content; refusing to overwrite it",
+                    extra={
+                        "event": EVENT_BLOB_DIGEST_COLLISION,
+                        "sha256": blob_path.name,
+                        "blob_path": str(blob_path),
+                        "existing_bytes": len(existing),
+                        "incoming_bytes": len(data),
+                    },
+                )
+                # The caller gets the digest — enough to identify exactly
+                # which artifact conflicted — and not the filesystem path.
                 raise ImmutabilityError(
-                    f"blob at {blob_path} already exists with different content "
-                    "for this digest path (on-disk corruption or a hash "
-                    "collision) — refusing to silently overwrite"
+                    f"an artifact blob for sha256 {blob_path.name} already "
+                    "exists with different content (on-disk corruption or a "
+                    "hash collision) — refusing to silently overwrite"
                 )
             self._atomic_write(blob_path, data)
 

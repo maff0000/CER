@@ -10,6 +10,14 @@ requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2",
     "fastapi>=0.110",
+    # Declared directly, not relied on transitively via fastapi:
+    # cer.api.errors imports starlette itself
+    # (`from starlette.exceptions import HTTPException`) to register the
+    # framework-HTTP-error handler. A direct import is a direct
+    # dependency — leaving it implicit means a future fastapi that
+    # vendored or renamed its starlette dependency would break CER at
+    # import time with nothing in this file to explain why.
+    "starlette>=0.36",
     "uvicorn>=0.27",
     "httpx>=0.27",
 ]

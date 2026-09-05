@@ -330,7 +330,7 @@ MetricValue = Union[float, int, str, bool]
 #: empty link list as "missing" would flag the overwhelming majority of
 #: valid root evidence as incomplete and swamp the genuinely useful signal
 #: (missing code commit, dataset ref, config identity, environment,
-#: metrics, ...). See the Engineer's report for this judgment call.
+#: metrics, ...).
 REQUIRED_PROVENANCE_FIELDS: tuple[str, ...] = (
     "strategy_id",
     "strategy_version",

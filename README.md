@@ -98,3 +98,6 @@ masks any field whose *name* looks secret-shaped before it is logged.
 * [`PID.md`](PID.md) — the authoritative product contract for CER v1.
 * [`docs/PRODUCER-GUIDE.md`](docs/PRODUCER-GUIDE.md) — integration guide
   for a producer team (HSA, APOLLO, NEO, ...) writing evidence into CER.
+* [`docs/KNOWN-LIMITATIONS.md`](docs/KNOWN-LIMITATIONS.md) — what CER v1
+  deliberately does not do, with the evidence for each and what changing it
+  would require. Read this before designing a system around CER.

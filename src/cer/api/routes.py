@@ -10,12 +10,21 @@ Identity generation
 --------------------
 ``run_id``, ``evidence_id``, ``experiment_id``, ``transition_id`` and
 ``health_id`` are generated *deterministically* from the caller's
-idempotency key when one is given (see :func:`_generate_id`): this is what
-makes "replay the same key with the same body" actually produce a
-byte-identical record for the store to recognise as the same submission,
-rather than a fresh id every time defeating idempotency at the API layer
-before the store ever sees it. Without an idempotency key, ids are random
-per the normal case.
+idempotency key when one is given (see :func:`_generate_id`). Without an
+idempotency key, ids are random per the normal case.
+
+What this buys is a *stable id across retries*: the same producer
+replaying the same key derives the same id rather than a fresh one each
+time, so logs, traces and any id a caller recorded from an earlier attempt
+all line up.
+
+It is deliberately not what makes replay detection work. The store keys
+replays on ``(producer, idempotency_key)`` and excludes the generated id
+from the content fingerprint it compares, so a replay is recognised as the
+same submission regardless of how its id was derived — which is why
+``POST /v1/artifacts``, whose identity is minted by the artifact store
+rather than derived here, is idempotent on exactly the same terms (see
+below).
 
 Which endpoints take an idempotency key
 -----------------------------------------
@@ -511,9 +520,10 @@ async def create_artifact(
 ) -> ArtifactRecord:
     """Register an artifact.
 
-    Accepts the artifact's raw bytes as the request body (not a multipart
-    upload — see the Engineer report for why: it keeps this endpoint
-    dependency-free). Metadata travels as headers: ``X-CER-Filename``
+    Accepts the artifact's raw bytes as the request body rather than a
+    multipart upload: multipart would pull in an extra parsing dependency
+    (``python-multipart``) for no gain, since exactly one file is ever
+    registered per call. Metadata travels as headers: ``X-CER-Filename``
     (required), ``Content-Type`` (optional, defaults to
     ``application/octet-stream`` — see below), ``X-CER-Content-Type``
     (optional, explicit override — see below), ``X-CER-Declared-Sha256``

@@ -165,6 +165,42 @@ def test_existing_blob_with_different_bytes_raises_immutability_error(tmp_path):
     assert blob_path.read_bytes() == b"some other bytes entirely, not the real content"
 
 
+def test_blob_collision_error_names_the_digest_and_never_the_on_disk_path(tmp_path, caplog):
+    """The collision error reaches a producer as a 409 body, so it must
+    identify the conflict by digest and must not hand back the absolute
+    blob path (storage internals producers are told not to depend on).
+    The path still has to reach the operator -- via the log."""
+    import logging
+
+    from cer.artifacts.fs_store import EVENT_BLOB_DIGEST_COLLISION
+
+    store = _make_store(tmp_path)
+    data = b"the real bytes whose canonical path is already occupied"
+    digest = _sha256(data)
+
+    blob_path = store._blob_path(digest)
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    blob_path.write_bytes(b"different content sitting under the same digest")
+
+    with caplog.at_level(logging.ERROR, logger="cer.artifacts.fs_store"):
+        with pytest.raises(ImmutabilityError) as excinfo:
+            store.put(data, content_type="text/plain", filename="d.txt")
+
+    message = str(excinfo.value)
+
+    # Identifies the conflict...
+    assert digest in message
+    # ...without leaking where it lives on disk.
+    assert str(blob_path) not in message
+    assert str(store.root) not in message
+    assert "/" not in message, f"the error message leaked a path: {message!r}"
+
+    # The operator still gets the full detail, on a greppable event.
+    [record] = [r for r in caplog.records if getattr(r, "event", None) == EVENT_BLOB_DIGEST_COLLISION]
+    assert record.blob_path == str(blob_path)
+    assert record.sha256 == digest
+
+
 def test_identical_content_written_twice_via_manual_blob_is_idempotent(tmp_path):
     store = _make_store(tmp_path)
     data = b"identical bytes, written once by hand first"

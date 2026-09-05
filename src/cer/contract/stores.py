@@ -3,7 +3,7 @@
 These are ``typing.Protocol`` definitions only — no implementations. They
 are the fixed boundary between the contract layer (this package) and the
 storage backends (a hash-addressed filesystem artifact store, a SQLite
-metadata store) and the HTTP service, all built by other Engineers against
+metadata store) and the HTTP service, all of which are written against
 these exact names and signatures.
 
 Semantics implementers must honour
