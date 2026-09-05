@@ -310,13 +310,80 @@ artifact = client.register_artifact(
 )
 ```
 
+**How the recorded content type is decided.** This matters because
+artifacts are immutable — there is no endpoint to correct a content type
+after registration, so getting it right the first time is the only chance
+you get. CER resolves it in this order:
+
+1. `X-CER-Content-Type`, if you send it — an explicit declaration channel,
+   recorded exactly as given (see below).
+2. otherwise the transport `Content-Type` header, but only if it's a
+   genuine declaration.
+3. otherwise `application/octet-stream` — the same fallback used when no
+   `Content-Type` is sent at all.
+
+A genuine declaration is stored verbatim, parameters included: `text/csv`
+is recorded as `text/csv`; `text/csv; charset=utf-8` is recorded as
+`text/csv; charset=utf-8`. But `application/x-www-form-urlencoded` and
+`multipart/form-data` (any case, with or without parameters) are never
+treated as a declaration, from either header. This endpoint takes the
+request body as the artifact's raw bytes and never parses form encoding,
+so a form-encoding value — real content or not — cannot truthfully
+describe what's being stored; it is treated as "not declared" and falls
+through to `application/octet-stream` like an absent header would.
+
+**This is not a corner case — it's what your client sends by default.**
+`curl -d`/`--data` sets `Content-Type: application/x-www-form-urlencoded`
+whether or not your payload is actually form-encoded; `requests`' file
+upload path (`files=...`) sets `multipart/form-data`. If you rely on
+either default with no other signal, your artifact is recorded as
+`application/octet-stream` — permanently, because artifacts are
+immutable:
+
+```
+$ curl -X POST http://cer.internal:8000/v1/artifacts \
+    -H "X-CER-Contract-Version: 1.0.0" \
+    -H "X-CER-Filename: equity_curve.csv" \
+    -d @equity_curve.csv
+# -d sets Content-Type: application/x-www-form-urlencoded by default ->
+# treated as not declared -> recorded as application/octet-stream, for good
+```
+
+Declare the real type instead — either as the transport header:
+
+```
+$ curl -X POST http://cer.internal:8000/v1/artifacts \
+    -H "X-CER-Contract-Version: 1.0.0" \
+    -H "X-CER-Filename: equity_curve.csv" \
+    -H "Content-Type: text/csv" \
+    --data-binary @equity_curve.csv
+```
+
+or, when your HTTP client sets the transport header itself and won't let
+you override it, declare it separately with `X-CER-Content-Type` — it
+wins regardless of what the transport header says:
+
+```
+-H "Content-Type: application/x-www-form-urlencoded"   (client-set, can't change it)
+-H "X-CER-Content-Type: text/csv"                       (your declaration wins)
+```
+
+`CERClient.register_artifact`'s `content_type` argument always becomes the
+literal transport `Content-Type` header CER receives — `CERClient` never
+leaves it to an HTTP library's default — so this specific pitfall bites
+raw-HTTP callers and any client library used directly, bypassing
+`CERClient`. Know the rule regardless: not every producer goes through
+`CERClient`, and a library update or a colleague's script can start
+sending a form-encoding default without anyone intending it.
+
 The full set of headers `POST /v1/artifacts` accepts:
 
 | Header | Required? | Purpose |
 |---|---|---|
 | `X-CER-Contract-Version` | Required (all `/v1/...` calls) | API contract compatibility — see §2 |
 | `X-CER-Filename` | Required | The artifact's filename |
-| `Content-Type` | Optional (defaults to `application/octet-stream`) | The artifact's media type |
+| `Content-Type` | Optional | The artifact's declared media type, recorded verbatim — but a form-encoding transport default (`application/x-www-form-urlencoded`, `multipart/form-data`) is treated as not declared. Falls back to `application/octet-stream` if absent, empty, or one of those defaults — see above |
+| `X-CER-Content-Type` | Optional | Explicit content-type declaration; takes precedence over `Content-Type` — see above |
 | `X-CER-Declared-Sha256` | Optional | Integrity check against the received bytes — see below |
 | `X-CER-Run-Id` | Optional | Immediate attachment to a run |
 | `X-CER-Evidence-Id` | Optional | Immediate attachment to an evidence record |
