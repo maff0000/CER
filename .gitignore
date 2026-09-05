@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Runtime state — never committed. CER's metadata DB and artifact blobs are
+# deployment data, and the PID requires config/state to live outside source.
+/data/
+*.db
+*.db-wal
+*.db-shm
+.env

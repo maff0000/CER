@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cer"
+version = "1.0.0"
+description = "Canonical Evidence Registry (CER) — versioned contract layer"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2",
+    "fastapi>=0.110",
+    # Declared directly, not relied on transitively via fastapi:
+    # cer.api.errors imports starlette itself
+    # (`from starlette.exceptions import HTTPException`) to register the
+    # framework-HTTP-error handler. A direct import is a direct
+    # dependency — leaving it implicit means a future fastapi that
+    # vendored or renamed its starlette dependency would break CER at
+    # import time with nothing in this file to explain why.
+    "starlette>=0.36",
+    "uvicorn>=0.27",
+    "httpx>=0.27",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# cer.metadata.migrations loads these .sql files from disk at runtime
+# (see cer/metadata/migrations.py); setuptools does not include non-.py
+# files in a package by default, so without this a built wheel/sdist
+# silently omits them and SQLiteMetadataStore fails at first construction
+# ("migration schema directory ... does not exist") — only visible once
+# the package is actually installed from a built distribution rather than
+# run in-place from a checkout, which is exactly what running in a
+# container does.
+"cer.metadata" = ["schema/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
