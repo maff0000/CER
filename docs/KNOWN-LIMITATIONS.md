@@ -11,6 +11,12 @@ reader can re-examine the judgment rather than having to take it on trust.
 Read this alongside [`PRODUCER-GUIDE.md`](PRODUCER-GUIDE.md), which tells a
 producer how to work within these limits today.
 
+Entry 2 was an open product question when v1 was delivered. It has since
+been settled by central architecture in
+[`adr/ADR-001-cross-producer-evidence-reference-resolution.md`](adr/ADR-001-cross-producer-evidence-reference-resolution.md),
+which ratifies v1's behaviour and defers the additions it calls for to a
+future versioned contract change. v1 conforms as delivered.
+
 **What is not on this list:** CER never acknowledges a write it then loses.
 That property is the spine of the registry and it holds — a `201` means the
 record is durable. Where the backing storage is genuinely unavailable, CER
@@ -150,35 +156,57 @@ require CER to resolve those references, and it explicitly does not make
 CER the arbiter of whether a transition was justified — "CER records
 transitions; it does not autonomously make promotion decisions."
 
-### The product question this raises
+### Ruled on by ADR-001
 
-This is worth deciding deliberately rather than patching, because
-resolution is not obviously the right behaviour.
+This was an open product question at the time CER v1 was delivered. It has
+since been settled by central architecture in **ADR-001 — Cross-Producer
+Evidence Reference Resolution** (`docs/adr/ADR-001-cross-producer-evidence-reference-resolution.md`),
+which ratifies the split described above rather than closing it.
 
-CER is a multi-producer registry. Independent producers write into it
-concurrently and in whatever order their own work completes. A producer
-recording a promotion or a health observation may legitimately cite
-evidence that another producer has not pushed yet, or that arrives seconds
-later. Enforcing resolution at write time would turn that ordinary race
-into a hard rejection, and would push producers into either retry loops or
-— worse — into recording a weaker citation that does resolve.
+The governing rule:
 
-So the real question is not "is this a bug" but "what is CER's ingestion
-ordering contract?" Plausible answers include: leave it as-is and treat
-dangling references as a reporting concern; resolve strictly and require
-producers to push evidence first; or resolve lazily and expose a
-"references unresolved" flag on the record the way provenance completeness
-already works. The third is the most consistent with how CER already
-handles incomplete information — it marks it rather than guessing or
-refusing — but it is a product decision, not a repair.
+> Asynchronous semantic references may dangle temporarily.
+> Transactional/causal references may not.
 
-### What fixing it would require
+That is precisely the behaviour recorded in the evidence table above, so
+CER v1 conforms to the ADR as delivered and requires no change under it.
+The ADR states this explicitly: *"CER v1 remains PRODUCT_GREEN and requires
+no change under this ADR."*
 
-Whichever answer is chosen: existence checks in the promotion and health
-write paths, a decision on what to do about the records already stored with
-dangling references, and — for the lazy option — a new persisted field, a
-schema migration, and a contract version bump. None of it is a small
-in-place correction.
+What the ADR adds, deferred to a future versioned contract change after
+v1.0.0, is the part v1 genuinely lacks: reference-resolution state tracked
+separately from the immutable record (`UNRESOLVED` / `RESOLVED` /
+`INVALID_TARGET`), a way for consumers to distinguish a citation being
+present from that citation being resolved, and a query for unresolved
+references older than a given age so operators can tell an ordinary arrival
+delay from broken producer lineage.
+
+The ADR's central distinction is worth stating in full, because it is what
+makes the permissive behaviour correct rather than merely tolerated:
+
+> **Reference accepted does not mean reference trusted.**
+
+### What this means for a v1 consumer today
+
+Because resolution state is deferred, a v1.0.0 consumer cannot tell a
+resolved citation from an unresolved one through the API. Under the ADR an
+unresolved reference must not count as verified supporting evidence for a
+promotion, a health conclusion or any assurance decision.
+
+So at v1.0.0: treat `evidence_ids` on a promotion or health record as a
+citation, not as verification. If you need trust, resolve the ids yourself
+with `GET /v1/evidence/{id}`. CER has never claimed these citations were
+verified, and it does not make promotion decisions — the PID is explicit
+that it records transitions rather than adjudicating them.
+
+### What implementing the ADR would require
+
+Not a repair, and not in v1: a persisted derived resolution index kept
+separate from the immutable records, a schema migration, new API fields and
+query endpoints, a contract version bump, and a decision on how the index is
+populated for records already stored. All of it must follow normal CER
+contract-versioning discipline, and existing v1.0.0 records must not be
+retroactively rewritten or reinterpreted.
 
 ---
 

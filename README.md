@@ -100,4 +100,7 @@ masks any field whose *name* looks secret-shaped before it is logged.
   for a producer team (HSA, APOLLO, NEO, ...) writing evidence into CER.
 * [`docs/KNOWN-LIMITATIONS.md`](docs/KNOWN-LIMITATIONS.md) — what CER v1
   deliberately does not do, with the evidence for each and what changing it
+* [`docs/adr/`](docs/adr/) — architecture decisions governing CER's
+  semantics. ADR-001 settles cross-producer evidence-reference resolution;
+  v1 conforms as delivered.
   would require. Read this before designing a system around CER.

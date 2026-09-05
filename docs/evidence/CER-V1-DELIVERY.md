@@ -138,3 +138,23 @@ loop's to make.
 - `/srv/CER` was never modified during the build; it remained at `b05104b`
   throughout, with all work done in separate worktrees.
 - Three independent audits, each dispatched with fresh context.
+
+## Post-delivery governance
+
+One of the three known limitations — that cited evidence references are not
+resolved — was recorded at delivery as an open product-authority question.
+Central architecture has since ruled on it in ADR-001, reproduced at
+`docs/adr/ADR-001-cross-producer-evidence-reference-resolution.md`.
+
+The ruling ratifies v1's behaviour rather than reversing it: asynchronous
+semantic references may dangle, transactional/causal references may not, and
+CER v1 was verified against the delivered branch to implement exactly that
+split. Resolution state, a citation-versus-trust distinction for consumers,
+and an aging-unresolved-references query are deferred to a future versioned
+contract change after v1.0.0.
+
+The ADR states that CER v1 remains PRODUCT_GREEN and requires no change
+under it. No commit in this delivery was rewritten to reflect the ruling —
+the record above stands as issued, and the correction is recorded here and
+in `docs/KNOWN-LIMITATIONS.md`, where the open question was raised.
+
