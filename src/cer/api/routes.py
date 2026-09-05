@@ -20,10 +20,10 @@ per the normal case.
 Which endpoints take an idempotency key
 -----------------------------------------
 ``POST /v1/evidence`` *requires* one. ``POST /v1/experiments/{id}/runs``,
-``POST /v1/experiments``, ``POST /v1/promotions`` and
-``POST /v1/health-records`` accept one *optionally* — as the
-``Idempotency-Key`` header or the body's ``idempotency_key`` field — and
-honour it identically: producer-scoped, deterministic id derivation,
+``POST /v1/experiments``, ``POST /v1/promotions``,
+``POST /v1/health-records`` and ``POST /v1/artifacts`` accept one
+*optionally* — as the ``Idempotency-Key`` header or the body's
+``idempotency_key`` field — and honour it identically: producer-scoped,
 replay returns the stored record, materially different body under the
 same producer and key is a 409. Omitting it keeps the plain-create
 behaviour (fresh id, new record). The PID's clause — "ingestion must
@@ -34,11 +34,28 @@ it: a retrying producer would record one intended promotion transition
 several times and corrupt the promotion history that is itself a
 first-class PID deliverable.
 
+``POST /v1/artifacts`` is the newest of those and the one exception to
+"deterministic id derivation": its identity is minted by the artifact
+store at ``put()`` time, so the replay lookup is by ``(producer,
+idempotency_key)`` against the metadata store instead — see
+:func:`create_artifact`. Content-addressing deduplicates the artifact's
+*bytes*, never its *registration*: without a key, two retries of one
+logical registration leave two indistinguishable records pointing at the
+same blob, which is exactly the "duplicate submissions must be
+detectable" failure the clause forbids.
+
 Idempotency keys are scoped to the producer, not global
 ---------------------------------------------------------
 For ``/v1/promotions`` and ``/v1/health-records`` the producer used for
 scoping is the one in the request body — the same value stored on the
 record itself — consistent with the other endpoints.
+
+``/v1/artifacts`` has no producer to take: its body is the artifact's raw
+bytes and ``ArtifactRecord`` has no producer field. A producer that wants
+idempotency there supplies one in the ``X-CER-Producer`` header, which is
+used *only* to scope the key (it is stored on the metadata row, not on
+the artifact record). A request with no ``Idempotency-Key`` needs no
+producer and behaves exactly as before.
 
 An idempotency key is only unique *within* the producer that supplied it:
 the deterministic derivation is ``uuid5(namespace, f"{kind}:{producer}:{key}")``,
@@ -56,6 +73,7 @@ not optional context, it is part of the key's identity.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -64,7 +82,7 @@ from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.responses import Response as RawResponse
 
 from cer.contract.enums import EvidenceType
-from cer.contract.errors import ContractViolationError
+from cer.contract.errors import ChecksumMismatchError, ContractViolationError
 from cer.contract.models import (
     ArtifactRecord,
     Experiment,
@@ -96,6 +114,23 @@ IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 _DETERMINISTIC_ID_NAMESPACE = uuid.UUID("b7e285c6-6b58-4b1a-9e2b-9d6a9c7a2f10")
 
 
+def _require_producer_for_key(producer: Optional[str]) -> str:
+    """Return ``producer``, or reject an unscoped idempotency key (400).
+
+    An idempotency key is scoped to its producer (see the module
+    docstring) — a key supplied without a non-empty ``producer`` is a
+    contract violation, never silently treated as an unscoped/global key.
+    One helper, so every endpoint that takes a key enforces the identical
+    rule with the identical message.
+    """
+    if not producer or not producer.strip():
+        raise ContractViolationError(
+            "an idempotency key requires a non-empty producer to scope it "
+            "(idempotency keys are scoped per-producer, not global)"
+        )
+    return producer
+
+
 def _generate_id(
     prefix: str, kind: str, idempotency_key: Optional[str], producer: Optional[str] = None
 ) -> str:
@@ -107,11 +142,7 @@ def _generate_id(
     contract violation, never silently treated as an unscoped/global key.
     """
     if idempotency_key:
-        if not producer or not producer.strip():
-            raise ContractViolationError(
-                "an idempotency key requires a non-empty producer to scope it "
-                "(idempotency keys are scoped per-producer, not global)"
-            )
+        _require_producer_for_key(producer)
         digest = uuid.uuid5(
             _DETERMINISTIC_ID_NAMESPACE, f"{kind}:{producer}:{idempotency_key}"
         ).hex
@@ -395,6 +426,9 @@ ARTIFACT_FILENAME_HEADER = "X-CER-Filename"
 ARTIFACT_SHA256_HEADER = "X-CER-Declared-Sha256"
 ARTIFACT_RUN_ID_HEADER = "X-CER-Run-Id"
 ARTIFACT_EVIDENCE_ID_HEADER = "X-CER-Evidence-Id"
+#: Scopes an Idempotency-Key on this endpoint only. Not stored on the
+#: ArtifactRecord (which has no producer field) — see create_artifact.
+ARTIFACT_PRODUCER_HEADER = "X-CER-Producer"
 _DEFAULT_ARTIFACT_CONTENT_TYPE = "application/octet-stream"
 
 
@@ -407,6 +441,8 @@ async def create_artifact(
     declared_sha256: Optional[str] = Header(default=None, alias=ARTIFACT_SHA256_HEADER),
     run_id: Optional[str] = Header(default=None, alias=ARTIFACT_RUN_ID_HEADER),
     evidence_id: Optional[str] = Header(default=None, alias=ARTIFACT_EVIDENCE_ID_HEADER),
+    producer: Optional[str] = Header(default=None, alias=ARTIFACT_PRODUCER_HEADER),
+    idempotency_key_header: Optional[str] = Header(default=None, alias=IDEMPOTENCY_KEY_HEADER),
 ) -> ArtifactRecord:
     """Register an artifact.
 
@@ -416,7 +452,33 @@ async def create_artifact(
     (required), ``Content-Type`` (optional, defaults to
     ``application/octet-stream``), ``X-CER-Declared-Sha256`` (optional
     integrity check), ``X-CER-Run-Id``/``X-CER-Evidence-Id`` (optional
-    immediate attachment).
+    immediate attachment), and ``Idempotency-Key`` + ``X-CER-Producer``
+    (optional retry-safety, see below).
+
+    Idempotency
+    ------------
+    ``Idempotency-Key`` is optional here, as it is on ``/v1/experiments``,
+    ``/v1/promotions`` and ``/v1/health-records``. When supplied it must
+    be accompanied by ``X-CER-Producer`` — a key is only unique within the
+    producer that chose it, so an unscoped key is refused (400) rather
+    than quietly given global reach. The producer scopes the key and
+    nothing else: it is recorded on the metadata row, never on the
+    ``ArtifactRecord``, which has no producer field.
+
+    A replay under the same ``(producer, key)`` returns the stored
+    ``ArtifactRecord`` — the *same* ``artifact_id``, not a second record
+    of the same bytes. A materially different body (different content,
+    size, content-type or filename) under the same key is a 409
+    ``idempotency_conflict``. Without a key, behaviour is exactly as
+    before: every call registers a new artifact.
+
+    Note the replay is resolved against the metadata store *before* the
+    bytes reach the artifact store. Doing it the other way round would
+    mint a fresh ``artifact_id`` and write a sidecar for every retry, then
+    discard it on discovering the replay — leaving artifacts on disk that
+    ``/download`` would serve but that this registry never issued and
+    ``GET /v1/artifacts/{id}`` reports as unknown. A conflicting
+    resubmission likewise stores nothing at all.
     """
     if not filename:
         raise ContractViolationError(f"missing required header {ARTIFACT_FILENAME_HEADER}")
@@ -431,6 +493,45 @@ async def create_artifact(
 
     content_type = request.headers.get("content-type") or _DEFAULT_ARTIFACT_CONTENT_TYPE
 
+    idem_key = idempotency_key_header or None
+    if idem_key:
+        scoping_producer = _require_producer_for_key(producer)
+        prior = metadata_store.find_artifact_by_idempotency_key(
+            producer=scoping_producer, idempotency_key=idem_key
+        )
+        if prior is not None:
+            computed_sha256 = hashlib.sha256(data).hexdigest()
+            # ArtifactStore.put() normally enforces this (see
+            # cer.contract.stores, "Checksums"), but the replay path
+            # deliberately never reaches it. A declared checksum that does
+            # not match the bytes must still fail loudly rather than be
+            # waved through as "a retry" — otherwise supplying a used key
+            # would be a way to bypass the integrity check entirely.
+            if declared_sha256 is not None and declared_sha256.lower() != computed_sha256:
+                raise ChecksumMismatchError(
+                    f"declared_sha256 {declared_sha256!r} does not match computed "
+                    f"digest {computed_sha256!r} — nothing written"
+                )
+            # A resubmission under a key already used by this producer.
+            # Overlay only what this request actually carries onto the
+            # stored record: the store-assigned fields (artifact_id, uri,
+            # registered_at) and the attachment fields belong to the
+            # original registration and are excluded from the idempotency
+            # comparison anyway (attach_artifact is the sanctioned path
+            # for re-linking, and registered_at is stamped per attempt).
+            # register_artifact then decides — faithful replay, or 409.
+            candidate = prior.model_copy(
+                update={
+                    "sha256": computed_sha256,
+                    "size_bytes": len(data),
+                    "content_type": content_type,
+                    "filename": filename,
+                }
+            )
+            return metadata_store.register_artifact(
+                candidate, idempotency_key=idem_key, producer=scoping_producer
+            )
+
     record = artifact_store.put(
         data,
         content_type=content_type,
@@ -439,7 +540,9 @@ async def create_artifact(
     )
     if run_id is not None or evidence_id is not None:
         record = record.model_copy(update={"run_id": run_id, "evidence_id": evidence_id})
-    return metadata_store.register_artifact(record)
+    return metadata_store.register_artifact(
+        record, idempotency_key=idem_key, producer=producer if idem_key else None
+    )
 
 
 @api_router.get("/artifacts/{artifact_id}", response_model=ArtifactRecord)

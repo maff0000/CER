@@ -288,12 +288,106 @@ def test_health_after_backing_volume_removed_does_not_recreate_root(tmp_path):
     # recreate an empty store root and report healthy.
     assert not store.root.exists()
 
-    with pytest.raises(NotFoundError):
-        # Correct: querying should still surface the previously-registered
-        # artifact as missing, but health() having already raised is what
-        # tells a caller *why* -- artifact storage is gone, not "this
-        # artifact_id was never registered".
+    # A read of a previously-registered artifact must report a SERVER-side
+    # storage failure, not "not registered". The artifact *is* registered;
+    # the storage is gone. NotFoundError here would surface as HTTP 404
+    # ("artifact_id ... is not registered"), telling the producer to check
+    # an id that was never the problem while the fault is entirely
+    # server-side. ArtifactStoreError surfaces as 503, which is the truth.
+    with pytest.raises(ArtifactStoreError) as exc_info:
         store.get(record.artifact_id)
+    assert not isinstance(exc_info.value, NotFoundError)
+    with pytest.raises(ArtifactStoreError):
+        store.stat(record.artifact_id)
+
+    # ...and the reads must not have recreated anything either.
+    assert not store.root.exists()
+
+
+def test_put_after_backing_volume_removed_refuses_and_does_not_recreate_root(tmp_path):
+    """The write path must not re-manufacture a store that has vanished.
+
+    Regression test for the defect this repair closes: ``put()`` used to
+    call ``initialise()`` unconditionally, so the first write after a
+    backing volume disappeared silently recreated an empty store, returned
+    a fresh record as though nothing were wrong, and flipped ``health()``
+    back to passing over a store that had quietly lost every artifact in
+    it -- precisely what ``health()`` itself refuses to do.
+    """
+    store = _make_store(tmp_path)
+    first = store.put(b"registered before the volume vanishes", content_type="text/plain", filename="k.txt")
+    assert store.health() is None
+
+    shutil.rmtree(store.root)
+    assert not store.root.exists()
+
+    with pytest.raises(ArtifactStoreError):
+        store.put(b"a write that must not be acknowledged", content_type="text/plain", filename="l.txt")
+
+    # Nothing recreated: no root, and therefore no "clean-looking" store.
+    assert not store.root.exists()
+
+    # And readiness must still be failing -- it must not have been
+    # repaired by the refused write.
+    with pytest.raises(ArtifactStoreError):
+        store.health()
+
+    # The earlier artifact is still reported as a storage failure, not 404.
+    with pytest.raises(ArtifactStoreError):
+        store.get(first.artifact_id)
+
+
+def test_put_after_marker_removed_refuses_even_though_directories_remain(tmp_path):
+    """Losing just the marker is still a vanished store, not a fresh one.
+
+    ``health()`` already treats a missing ``store.json`` as unhealthy
+    (test_health_raises_when_marker_missing_but_directories_present); the
+    write path must agree, or the two disagree about the same store.
+    """
+    store = _make_store(tmp_path)
+    store.initialise()
+    store._marker_path().unlink()
+
+    with pytest.raises(ArtifactStoreError):
+        store.put(b"nope", content_type="text/plain", filename="m.txt")
+
+    assert not store._marker_path().exists()
+
+
+def test_never_initialised_store_still_initialises_on_first_write(tmp_path):
+    """The guard must not break legitimate first-time initialisation.
+
+    A store that has never been initialised has no artifacts to lose, so
+    lazily creating its layout on the first write is startup, not
+    resurrection -- and must keep working.
+    """
+    store = _make_store(tmp_path)
+    assert not store.root.exists()
+
+    record = store.put(b"first ever write", content_type="text/plain", filename="n.txt")
+
+    assert store.health() is None
+    assert store.get(record.artifact_id) == b"first ever write"
+
+
+def test_second_instance_on_a_vanished_root_refuses_to_write(tmp_path):
+    """A store constructed against an already-initialised root is guarded
+    from its first call, without needing initialise() in this process.
+
+    This is the restart case: a new process opens the same root, sees a
+    valid layout, and must then refuse writes if that layout disappears
+    underneath it -- exactly as the process that created it would.
+    """
+    root = tmp_path / "store"
+    store1 = FilesystemArtifactStore(root, max_bytes=10_000_000)
+    store1.initialise()
+
+    store2 = FilesystemArtifactStore(root, max_bytes=10_000_000)
+    shutil.rmtree(root)
+
+    with pytest.raises(ArtifactStoreError):
+        store2.put(b"nope", content_type="text/plain", filename="o.txt")
+    assert not root.exists()
 
 
 def test_health_raises_when_marker_missing_but_directories_present(tmp_path):

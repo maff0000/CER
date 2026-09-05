@@ -17,6 +17,7 @@ import pytest
 
 from cer.contract.enums import EvidenceType, HealthState, PromotionState, RunStatus
 from cer.contract.errors import (
+    ContractViolationError,
     ImmutabilityError,
     IdempotencyConflictError,
     MetadataStoreError,
@@ -775,6 +776,109 @@ def test_register_artifact_conflict_raises_immutability(store):
     store.register_artifact(artifact)
     with pytest.raises(ImmutabilityError):
         store.register_artifact(make_artifact(artifact_id=artifact.artifact_id, sha256="c" * 64))
+
+
+# --- artifact idempotency (producer-scoped, optional key) -------------------
+
+
+def test_register_artifact_replay_under_same_key_returns_stored_record(store):
+    """Content-addressing dedups the blob; only a key dedups the RECORD.
+
+    Both calls below carry a fresh artifact_id, exactly as a retry through
+    the API does (the artifact store mints one per put()). Without the
+    key that is two indistinguishable registrations of the same artifact.
+    """
+    first = store.register_artifact(make_artifact(), idempotency_key="art-key-1", producer="HSA")
+    replay = store.register_artifact(
+        make_artifact(uri="file:///artifacts/elsewhere.json", registered_at=_now(3600)),
+        idempotency_key="art-key-1",
+        producer="HSA",
+    )
+    assert replay == first
+    assert replay.artifact_id == first.artifact_id
+    assert len(store.query_artifacts()) == 1
+
+
+def test_register_artifact_same_key_different_content_is_idempotency_conflict(store):
+    store.register_artifact(make_artifact(), idempotency_key="art-key-2", producer="HSA")
+    with pytest.raises(IdempotencyConflictError):
+        store.register_artifact(
+            make_artifact(sha256="c" * 64), idempotency_key="art-key-2", producer="HSA"
+        )
+    with pytest.raises(IdempotencyConflictError):
+        store.register_artifact(
+            make_artifact(filename="something_else.json"),
+            idempotency_key="art-key-2",
+            producer="HSA",
+        )
+    assert len(store.query_artifacts()) == 1
+
+
+def test_register_artifact_keys_are_scoped_per_producer(store):
+    """Two producers may use the same key string for unrelated artifacts."""
+    hsa = store.register_artifact(make_artifact(), idempotency_key="shared", producer="HSA")
+    neo = store.register_artifact(
+        make_artifact(sha256="d" * 64), idempotency_key="shared", producer="NEO"
+    )
+    assert hsa.artifact_id != neo.artifact_id
+    assert len(store.query_artifacts()) == 2
+
+
+def test_register_artifact_without_key_keeps_plain_create_behaviour(store):
+    """No key means no idempotency -- two registrations, two records."""
+    a1 = store.register_artifact(make_artifact())
+    a2 = store.register_artifact(make_artifact())
+    assert a1.artifact_id != a2.artifact_id
+    assert len(store.query_artifacts()) == 2
+
+
+def test_register_artifact_key_without_producer_is_refused(store):
+    with pytest.raises(ContractViolationError):
+        store.register_artifact(make_artifact(), idempotency_key="unscoped")
+    with pytest.raises(ContractViolationError):
+        store.register_artifact(make_artifact(), idempotency_key="unscoped", producer="   ")
+    assert store.query_artifacts() == []
+
+
+def test_register_artifact_replay_survives_a_fresh_registered_at(store):
+    """A server-stamped registered_at must never make a retry a conflict.
+
+    The API stamps registered_at per attempt, so an honest retry always
+    carries a different one. Same rule as Run.started_at and every other
+    server-assigned creation timestamp in this store.
+    """
+    first = store.register_artifact(make_artifact(), idempotency_key="art-key-3", producer="APOLLO")
+    replay = store.register_artifact(
+        make_artifact(registered_at=_now(7200)), idempotency_key="art-key-3", producer="APOLLO"
+    )
+    assert replay == first
+
+
+def test_find_artifact_by_idempotency_key(store):
+    assert store.find_artifact_by_idempotency_key(producer="HSA", idempotency_key="nope") is None
+    stored = store.register_artifact(make_artifact(), idempotency_key="art-key-4", producer="HSA")
+    assert store.find_artifact_by_idempotency_key(producer="HSA", idempotency_key="art-key-4") == stored
+    # Scoped: another producer's identical key string is not a hit.
+    assert store.find_artifact_by_idempotency_key(producer="NEO", idempotency_key="art-key-4") is None
+    with pytest.raises(ContractViolationError):
+        store.find_artifact_by_idempotency_key(producer="", idempotency_key="art-key-4")
+
+
+def test_register_artifact_idempotency_survives_restart(store, tmp_path):
+    """A retry after a process restart must still be recognised as a replay."""
+    first = store.register_artifact(make_artifact(), idempotency_key="art-restart", producer="HSA")
+    db_path = store._db_path
+    store.close()
+
+    reopened = SQLiteMetadataStore(db_path)
+    try:
+        replay = reopened.register_artifact(
+            make_artifact(registered_at=_now(60)), idempotency_key="art-restart", producer="HSA"
+        )
+        assert replay == first
+        assert len(reopened.query_artifacts()) == 1
+    finally:
+        reopened.close()
 
 
 def test_attach_artifact_links_and_is_idempotent(store):

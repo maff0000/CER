@@ -36,6 +36,7 @@ def test_metadata_store_is_runtime_checkable_protocol():
         "close_run",
         "append_evidence",
         "register_artifact",
+        "find_artifact_by_idempotency_key",
         "attach_artifact",
         "record_promotion",
         "record_health",

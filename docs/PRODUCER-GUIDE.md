@@ -42,7 +42,7 @@ info = httpx.get("http://cer.internal:8000/v1/version").json()
 
 Every other `/v1/...` call must carry `X-CER-Contract-Version` set to a
 version whose **major** component matches the server's `contract_version`
-(a mismatch fails loudly — see §7). `CERClient` does this automatically,
+(a mismatch fails loudly — see §10). `CERClient` does this automatically,
 pinned to the contract version the `cer` package you imported was built
 against:
 
@@ -72,14 +72,12 @@ sv = client.register_strategy_version(
 Both calls are safe to repeat with the *same* content (they return the
 existing record); repeating with *different* content for the same id
 raises `ImmutabilityError` (409) — see §9. "Same content" is compared
-field-for-field, and that includes `created_at`: if you don't pass
-`created_at` explicitly, each call is stamped with the server's current
-time, so an otherwise-identical retry that also omits `created_at` will be
-seen as *different* content and raise `ImmutabilityError` rather than
-returning the existing record. Most producers register a strategy/version
-once and never repeat the call, so this rarely matters in practice — but
-if you do need this call to be retry-safe, pass the same explicit
-`created_at` every time for a given `strategy_id`/`strategy_version`.
+field-for-field, excluding the server-assigned `created_at` — you never
+need to pass `created_at` yourself for this comparison to succeed, and an
+otherwise-identical retry that omits it (as the examples above do) returns
+the existing record rather than raising an error. A retry is only ever an
+`ImmutabilityError` when a field you actually author — `name`, `thesis`,
+`git_commit`, `notes`, and so on — genuinely differs from what's stored.
 
 ## 4. Experiment and run
 
@@ -103,7 +101,7 @@ run = client.create_run(
 immediately whether this run has everything CER considers reproducibility
 context (`producer_version`, `git_repo`, `git_commit`, `dataset_id`,
 `dataset_version`, `dataset_ref`, `config_hash`, `config_ref`,
-`environment`) — see §8.
+`environment`) — see §7.
 
 Close the run when it's done:
 
@@ -126,6 +124,7 @@ so know where each call you make falls in the table below:
 | `POST /v1/experiments` | `create_experiment` | Optional, honoured when supplied | Every call creates a new experiment |
 | `POST /v1/promotions` | `record_promotion` | Optional, honoured when supplied | Every call records a new transition |
 | `POST /v1/health-records` | `record_health` | Optional, honoured when supplied | Every call records a new health observation |
+| `POST /v1/artifacts` | `register_artifact` | Optional, producer-scoped, honoured when supplied | Every call creates a new artifact *record* (see below — the underlying blob is not duplicated) |
 
 **On the optional endpoints, omitting the key does not make the call
 "unsafe" in some vague sense — it means a retry (a timeout you retried, a
@@ -138,6 +137,21 @@ duplicated transition (the same `DRAFT` -> `IMPLEMENTED` recorded twice)
 corrupts that history for every consumer of it, not just the caller who
 retried. If your promotion-recording code path can ever be retried
 (anything calling over HTTP can), pass an idempotency key.
+
+**`register_artifact` needs calling out separately, because "duplicate"
+means something narrower there than it does everywhere else in this
+table.** The artifact *blob* is always content-addressed and deduplicated
+by CER regardless of whether you pass a key — uploading the same bytes
+twice never stores the bytes twice. What an omitted key duplicates is the
+artifact *record* — the row that gives those bytes their own `artifact_id`,
+`registered_at`, and `run_id`/`evidence_id` attachment. Retry a
+`register_artifact` call with no key and you get two `artifact_id`s
+pointing at the same underlying blob, which is exactly the kind of
+surprise a producer would otherwise assume can't happen ("it's
+content-addressed, so retries must be safe" — the blob, yes; the record,
+no). Pass an idempotency key when the registration call might be retried
+and you want a retry to hand back the original record instead of minting
+a second one.
 
 In every case, a retry with the **same** producer, the **same** key, and
 an **identical** body returns the stored record — never a duplicate,
@@ -280,6 +294,7 @@ artifact = client.register_artifact(
     content_type="text/csv",
     run_id=run.run_id,
     evidence_id=evidence.evidence_id,
+    idempotency_key="hsa-2026-09-04-equity-curve",  # optional -- see §5
 )
 ```
 
@@ -293,6 +308,7 @@ X-CER-Filename: equity_curve.csv
 X-CER-Run-Id: run_...            (optional, immediate attachment)
 X-CER-Evidence-Id: ev_...        (optional, immediate attachment)
 X-CER-Declared-Sha256: <hex>     (optional integrity check -- see below)
+Idempotency-Key: <key>           (optional, producer-scoped -- see §5)
 
 <raw bytes as the body>
 ```
@@ -349,9 +365,10 @@ files a given run produced.
 * **Strategies and strategy versions**: re-registering the same
   `strategy_id` / `(strategy_id, strategy_version)` with identical content
   is a no-op that returns the existing record; with *different* content it
-  raises `ImmutabilityError` (409) — see §3 for the `created_at` caveat on
-  what counts as "identical". A strategy version is never edited in place
-  — a logic change is a new version.
+  raises `ImmutabilityError` (409) — see §3 for what counts as "identical"
+  (the server-assigned `created_at` is excluded from that comparison). A
+  strategy version is never edited in place — a logic change is a new
+  version.
 * **Evidence**: once written, an evidence record's content never changes.
   A same-key-same-body retry returns the original; a same-key-different-body
   retry is `IdempotencyConflictError` (409); a direct clash on
@@ -386,7 +403,7 @@ matching exception from `cer.contract.errors` for each code below.
 | `idempotency_conflict` | 409 | Same `(producer, idempotency_key)` was already used with different content | This is a real conflict, not a transient error — do not blindly retry; use a new key for genuinely new content |
 | `immutability_violation` | 409 | An attempt to change an already-written immutable record (different content on re-registration, relinking an already-attached artifact, re-closing a closed run) | Do not retry as-is; if this is truly new information, create a new record instead of overwriting |
 | `not_found` | 404 | The referenced id (evidence/run/artifact/experiment/strategy) doesn't exist | Check the id; don't assume eventual consistency will fix it |
-| `metadata_store_error` | 503 | The metadata backend is unavailable | Transient — safe to retry with backoff; nothing was written |
+| `metadata_store_error` | 503 | The metadata backend is unavailable | Transient — safe to retry with backoff; no record is created and nothing is retrievable (on `POST /v1/artifacts` specifically, the blob may already be written to the artifact store by the time metadata registration fails — no record exists to find it by, but it is not accurate to say nothing at all was written) |
 | `artifact_store_error` | 503 | The artifact backend is unavailable | Transient — safe to retry with backoff; nothing was written |
 | `http_error` | varies | A framework-level HTTP error (route not found, wrong method) | Check the URL/method |
 | `internal_error` | 500 | An unexpected server-side failure | Retriable, but report it — this is not an expected error path |

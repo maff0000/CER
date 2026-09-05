@@ -29,11 +29,21 @@ treating it as unscoped.
 Which calls take an idempotency key
 -------------------------------------
 ``append_evidence`` requires one. ``create_run``, ``create_experiment``,
-``record_promotion`` and ``record_health`` accept one optionally: pass it
-and your retry of the same call is safe (the stored record comes back,
-no duplicate row); omit it and you get an ordinary create. A materially
-different body under a key you already used is a 409
-``idempotency_conflict``, never a silent overwrite.
+``record_promotion``, ``record_health`` and ``register_artifact`` accept
+one optionally: pass it and your retry of the same call is safe (the
+stored record comes back, no duplicate row); omit it and you get an
+ordinary create. A materially different body under a key you already used
+is a 409 ``idempotency_conflict``, never a silent overwrite.
+
+``register_artifact`` needs its ``producer`` passed explicitly alongside
+the key (it travels as the ``X-CER-Producer`` header). Unlike the other
+calls there is no producer anywhere else in an artifact registration to
+take it from — the request body is the artifact's raw bytes, and an
+``ArtifactRecord`` has no producer field. Note that CER deduplicates an
+artifact's *bytes* by content hash regardless: without a key, retrying a
+registration stores the blob once but leaves you two ``artifact_id`` values
+for one logical registration, with nothing to tell you they are the same
+submission.
 """
 
 from __future__ import annotations
@@ -376,8 +386,17 @@ class CERClient:
         declared_sha256: Optional[str] = None,
         run_id: Optional[str] = None,
         evidence_id: Optional[str] = None,
+        producer: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> ArtifactRecord:
-        headers = self._headers()
+        """Register an artifact's bytes and return its ``ArtifactRecord``.
+
+        ``idempotency_key`` is optional; when given, ``producer`` must be
+        given too (the key is scoped to it — see the module docstring) and
+        a retry returns the stored record with the same ``artifact_id``
+        instead of registering the same bytes a second time.
+        """
+        headers = self._headers(idempotency_key=idempotency_key)
         headers["Content-Type"] = content_type
         headers["X-CER-Filename"] = filename
         if declared_sha256:
@@ -386,6 +405,8 @@ class CERClient:
             headers["X-CER-Run-Id"] = run_id
         if evidence_id:
             headers["X-CER-Evidence-Id"] = evidence_id
+        if producer:
+            headers["X-CER-Producer"] = producer
         resp = self._request("POST", "/v1/artifacts", content=data, headers=headers)
         return ArtifactRecord.model_validate(resp.json())
 

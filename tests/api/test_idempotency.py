@@ -457,3 +457,150 @@ def test_health_record_same_key_different_producers_do_not_collide(client):
     r2 = client.post("/v1/health-records", json=_health_body(producer="APOLLO"), headers=hdrs)
     assert r1.status_code == 201 and r2.status_code == 201
     assert r1.json()["health_id"] != r2.json()["health_id"]
+
+
+# --- artifact idempotency ----------------------------------------------
+#
+# Content-addressing dedups an artifact's BYTES, never its REGISTRATION.
+# Before the key was honoured here, two identical POSTs stored one blob
+# but returned two artifact_ids, leaving the registry holding two
+# indistinguishable records of one logical submission with nothing to tell
+# them apart -- the exact "duplicate submissions must be detectable"
+# failure the PID forbids, on a required v1 capability.
+
+
+def _artifact_headers(**extra):
+    base = {"Content-Type": "text/plain", "X-CER-Filename": "report.txt"}
+    base.update(extra)
+    return headers(**base)
+
+
+def test_artifact_idempotent_replay_returns_same_record(client):
+    payload = b"one logical registration, retried"
+    hdrs = _artifact_headers(**{"X-CER-Producer": "HSA", "Idempotency-Key": "art-key-1"})
+
+    r1 = client.post("/v1/artifacts", content=payload, headers=hdrs)
+    r2 = client.post("/v1/artifacts", content=payload, headers=hdrs)
+
+    assert r1.status_code == 201, r1.text
+    assert r2.status_code == 201, r2.text
+    assert r1.json() == r2.json()
+    assert r1.json()["artifact_id"] == r2.json()["artifact_id"]
+
+
+def test_artifact_retried_three_times_registers_one_artifact(client):
+    payload = b"retried three times"
+    hdrs = _artifact_headers(**{"X-CER-Producer": "HSA", "Idempotency-Key": "art-key-2"})
+
+    ids = set()
+    for _ in range(3):
+        resp = client.post("/v1/artifacts", content=payload, headers=hdrs)
+        assert resp.status_code == 201, resp.text
+        ids.add(resp.json()["artifact_id"])
+
+    assert len(ids) == 1, "one logical registration must yield exactly one artifact_id"
+
+    listed = client.get("/v1/artifacts", headers=headers()).json()
+    assert len([a for a in listed if a["artifact_id"] in ids]) == 1
+
+
+def test_artifact_conflicting_replay_is_409(client):
+    hdrs = _artifact_headers(**{"X-CER-Producer": "HSA", "Idempotency-Key": "art-key-3"})
+    first = client.post("/v1/artifacts", content=b"original bytes", headers=hdrs)
+    assert first.status_code == 201, first.text
+
+    conflicting = client.post("/v1/artifacts", content=b"different bytes entirely", headers=hdrs)
+    assert conflicting.status_code == 409, conflicting.text
+    assert conflicting.json()["code"] == "idempotency_conflict"
+
+
+def test_artifact_conflicting_filename_under_same_key_is_409(client):
+    payload = b"same bytes, different declared filename"
+    first = client.post(
+        "/v1/artifacts",
+        content=payload,
+        headers=_artifact_headers(**{"X-CER-Producer": "HSA", "Idempotency-Key": "art-key-4"}),
+    )
+    assert first.status_code == 201, first.text
+
+    conflicting = client.post(
+        "/v1/artifacts",
+        content=payload,
+        headers=headers(**{
+            "Content-Type": "text/plain",
+            "X-CER-Filename": "a_completely_different_name.txt",
+            "X-CER-Producer": "HSA",
+            "Idempotency-Key": "art-key-4",
+        }),
+    )
+    assert conflicting.status_code == 409, conflicting.text
+    assert conflicting.json()["code"] == "idempotency_conflict"
+
+
+def test_artifact_without_a_key_registers_every_call(client):
+    """Omitting the key keeps the previous behaviour exactly."""
+    payload = b"no key supplied"
+    hdrs = _artifact_headers()
+    r1 = client.post("/v1/artifacts", content=payload, headers=hdrs)
+    r2 = client.post("/v1/artifacts", content=payload, headers=hdrs)
+
+    assert r1.status_code == 201 and r2.status_code == 201
+    assert r1.json()["artifact_id"] != r2.json()["artifact_id"]
+
+
+def test_artifact_same_key_different_producers_do_not_collide(client):
+    """One producer's key choice must never deny or shadow another's."""
+    hsa = client.post(
+        "/v1/artifacts",
+        content=b"HSA's artifact",
+        headers=_artifact_headers(**{"X-CER-Producer": "HSA", "Idempotency-Key": "shared-key"}),
+    )
+    neo = client.post(
+        "/v1/artifacts",
+        content=b"NEO's completely unrelated artifact",
+        headers=_artifact_headers(**{"X-CER-Producer": "NEO", "Idempotency-Key": "shared-key"}),
+    )
+    assert hsa.status_code == 201, hsa.text
+    assert neo.status_code == 201, neo.text
+    assert hsa.json()["artifact_id"] != neo.json()["artifact_id"]
+
+
+def test_artifact_idempotency_key_without_producer_is_400(client):
+    resp = client.post(
+        "/v1/artifacts",
+        content=b"bytes",
+        headers=_artifact_headers(**{"Idempotency-Key": "unscoped-key"}),
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == "contract_violation"
+
+
+def test_artifact_producer_without_a_key_is_ignored_not_rejected(client):
+    """X-CER-Producer alone is harmless -- it only ever scopes a key."""
+    resp = client.post(
+        "/v1/artifacts",
+        content=b"bytes",
+        headers=_artifact_headers(**{"X-CER-Producer": "HSA"}),
+    )
+    assert resp.status_code == 201, resp.text
+    # It is not smuggled onto the record: ArtifactRecord has no producer.
+    assert "producer" not in resp.json()
+
+
+def test_artifact_replay_with_a_bad_declared_checksum_is_still_422(client):
+    """A used key must not become a way past the integrity check."""
+    hdrs = _artifact_headers(**{"X-CER-Producer": "HSA", "Idempotency-Key": "art-key-5"})
+    first = client.post("/v1/artifacts", content=b"honest bytes", headers=hdrs)
+    assert first.status_code == 201, first.text
+
+    resp = client.post(
+        "/v1/artifacts",
+        content=b"honest bytes",
+        headers=_artifact_headers(**{
+            "X-CER-Producer": "HSA",
+            "Idempotency-Key": "art-key-5",
+            "X-CER-Declared-Sha256": "0" * 64,
+        }),
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "checksum_mismatch"

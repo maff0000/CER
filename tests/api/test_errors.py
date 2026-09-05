@@ -160,28 +160,59 @@ def test_conflicting_idempotent_run_replay_is_409(client):
     assert r2.json()["code"] == "idempotency_conflict"
 
 
-def test_re_registering_artifact_with_different_attachment_is_immutability_conflict(client):
-    payload = b"same-bytes-both-times"
-    r1 = client.post(
-        "/v1/artifacts",
-        content=payload,
-        headers=headers(**{"Content-Type": "text/plain", "X-CER-Filename": "f.txt"}),
-    )
-    assert r1.status_code == 201, r1.text
+def test_conflicting_idempotent_artifact_replay_is_409(client):
+    """Same producer, same key, materially different bytes -> 409.
 
-    # Same content (same hash-addressed artifact_id) but now attached to a
-    # run_id -- a materially different record for the same immutable id.
-    r2 = client.post(
+    This replaces an earlier test that registered identical bytes twice
+    with no idempotency key and expected 409 immutability_violation. That
+    409 was an artefact of the OLD FakeArtifactStore, which derived
+    artifact_id from the content digest, so a second registration of the
+    same bytes collided on one immutable id. The real
+    FilesystemArtifactStore mints a fresh artifact_id per put() by design
+    (identical bytes share one blob but are two registrations), so it
+    never reaches that collision -- the old assertion could only ever hold
+    against the fake. Registration-level duplicate detection is what an
+    idempotency key is actually for, and that is what is asserted here.
+    """
+    first = client.post(
         "/v1/artifacts",
-        content=payload,
+        content=b"the original bytes",
         headers=headers(**{
             "Content-Type": "text/plain",
             "X-CER-Filename": "f.txt",
-            "X-CER-Run-Id": "run_" + "0" * 32,
+            "X-CER-Producer": "HSA",
+            "Idempotency-Key": "artifact-conflict-key",
         }),
     )
-    assert r2.status_code == 409, r2.text
-    assert r2.json()["code"] == "immutability_violation"
+    assert first.status_code == 201, first.text
+
+    second = client.post(
+        "/v1/artifacts",
+        content=b"materially different bytes",
+        headers=headers(**{
+            "Content-Type": "text/plain",
+            "X-CER-Filename": "f.txt",
+            "X-CER-Producer": "HSA",
+            "Idempotency-Key": "artifact-conflict-key",
+        }),
+    )
+    assert second.status_code == 409, second.text
+    assert second.json()["code"] == "idempotency_conflict"
+
+
+def test_artifact_idempotency_key_without_producer_is_400(client):
+    """An unscoped key is not a key -- reject it, never silently globalise it."""
+    resp = client.post(
+        "/v1/artifacts",
+        content=b"bytes",
+        headers=headers(**{
+            "Content-Type": "text/plain",
+            "X-CER-Filename": "f.txt",
+            "Idempotency-Key": "unscoped-key",
+        }),
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == "contract_violation"
 
 
 # --- 422 checksum mismatch --------------------------------------------------

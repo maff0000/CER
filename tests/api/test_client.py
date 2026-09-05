@@ -115,6 +115,39 @@ def test_client_full_flow(cer_client):
     assert len(healths) >= 1
 
 
+def test_client_register_artifact_is_idempotent_with_a_key(cer_client):
+    """The client must actually plumb the key and its producer through.
+
+    Without ``producer`` the server refuses the key (400), so a client
+    that sent one and not the other would look like it supported
+    idempotency here while never getting it.
+    """
+    first = cer_client.register_artifact(
+        b"client artifact bytes",
+        "curve.csv",
+        content_type="text/csv",
+        producer="HSA",
+        idempotency_key="client-art-1",
+    )
+    replay = cer_client.register_artifact(
+        b"client artifact bytes",
+        "curve.csv",
+        content_type="text/csv",
+        producer="HSA",
+        idempotency_key="client-art-1",
+    )
+    assert replay.artifact_id == first.artifact_id
+
+    with pytest.raises(IdempotencyConflictError):
+        cer_client.register_artifact(
+            b"materially different bytes",
+            "curve.csv",
+            content_type="text/csv",
+            producer="HSA",
+            idempotency_key="client-art-1",
+        )
+
+
 def test_client_raises_not_found_error(cer_client):
     with pytest.raises(NotFoundError):
         cer_client.get_evidence("ev_doesnotexist")

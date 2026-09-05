@@ -72,8 +72,9 @@ deliberately separate operations:
 * :meth:`initialise` is the only thing that creates anything. It is
   idempotent and safe to call repeatedly (e.g. once at service startup) —
   it never touches existing blobs or sidecars, and never rewrites an
-  already-present marker. :meth:`put` calls it lazily on first write, so
-  a store still works out of the box against a fresh root.
+  already-present marker. :meth:`put` calls it lazily on the *first* write
+  to a never-yet-initialised root, so a store still works out of the box
+  against a fresh root.
 * :meth:`health` never creates anything. It requires the root, ``blobs/``,
   ``index/`` and the marker to already be present, then proves writability
   with a probe file created inside the existing root and removed. If the
@@ -82,6 +83,46 @@ deliberately separate operations:
   rather than silently recreating an empty store and reporting healthy —
   an evidence registry must never manufacture a clean-looking store out of
   a disappeared one.
+
+First-time initialisation vs. silent re-creation
+--------------------------------------------------
+Lazy initialisation in :meth:`put` used to be unconditional, which meant
+the write path did exactly what :meth:`health` refuses to do: a store
+whose backing volume had vanished was re-manufactured, empty, by the next
+``put()``. The registry then acknowledged ``201 Created``, ``/ready``
+flipped back from 503 to 200, and every artifact registered before the
+volume disappeared was silently gone while its metadata still asserted it
+existed. That is the artifact-side twin of the durable-backing guard the
+metadata store already applies to every write
+(``SQLiteMetadataStore._require_durable_backing``), and it is closed the
+same way — with one cheap existence check on the paths that matter, not a
+thread, watchdog or polling loop.
+
+The ``store.json`` marker is what separates the two cases, together with
+an instance flag (:attr:`_initialised`) recording whether *this* store
+object has ever seen a fully-present backing layout:
+
+* **Never initialised** (no marker was ever observed): :meth:`put` may
+  still initialise on first write. That is legitimate startup against a
+  fresh root, not resurrection.
+* **Initialised, then vanished** (the marker/root was present and is not
+  any more): :meth:`put` raises
+  :class:`~cer.contract.errors.ArtifactStoreError` — HTTP 503 — instead of
+  re-creating the layout. A producer that receives ``201`` must be able to
+  rely on it.
+
+The same check guards the *read* path, but only on the miss branch of
+:meth:`stat` so the happy path pays nothing. Without it a vanished store
+reports ``NotFoundError`` → ``404 "artifact_id ... is not registered"``
+for evidence that *is* registered, telling the producer to check an
+``artifact_id`` that was never the problem. A server-side storage failure
+must read as a server-side failure (503), never as a 404 blaming the
+caller.
+
+Like the metadata store's guard, this does not (and cannot) defeat POSIX:
+a path that disappears in the microseconds between the check and the
+write is still lost. It closes the operationally real case — backing gone
+for the remaining life of the process — not an instantaneous race.
 """
 
 from __future__ import annotations
@@ -148,6 +189,14 @@ class FilesystemArtifactStore:
         # write bit-identical bytes to the same digest-derived path) but it
         # avoids wasted double I/O and keeps the reasoning simple.
         self._lock = threading.Lock()
+        # True once this instance has observed (or created) a fully-present
+        # backing layout. It is what distinguishes "never initialised, may
+        # initialise on first write" from "was initialised and has since
+        # vanished, must refuse" -- see the module docstring's "First-time
+        # initialisation vs. silent re-creation" section. Seeded from disk
+        # so a store constructed against an already-initialised root (the
+        # ordinary restart case) is guarded from its very first call.
+        self._initialised = self._backing_present()
 
     # -- path helpers --------------------------------------------------
 
@@ -183,6 +232,47 @@ class FilesystemArtifactStore:
         ):
             raise NotFoundError(f"artifact_id {artifact_id!r} is not a known artifact")
         return artifact_id
+
+    # -- backing-storage presence ------------------------------------------
+
+    def _backing_present(self) -> bool:
+        """Return whether the full on-disk layout is present right now.
+
+        The root, ``blobs/``, ``index/`` and the ``store.json`` marker must
+        all exist. This is the single cheap existence check the write path
+        (:meth:`put`), the read path (:meth:`stat`'s miss branch) and
+        :meth:`health` are all built on, so none of them can disagree
+        about whether the store's backing storage is still there.
+        """
+        try:
+            return (
+                self.root.is_dir()
+                and self.blobs_dir.is_dir()
+                and self.index_dir.is_dir()
+                and self._marker_path().is_file()
+            )
+        except OSError:
+            # A path that cannot even be stat-ed is, for every purpose
+            # here, not present.
+            return False
+
+    def _require_live_backing(self, *, refusing_to: str) -> None:
+        """Raise ``ArtifactStoreError`` if backing that was there has gone.
+
+        A store that has *never* been initialised is left alone: it has no
+        artifacts to lose, and first-write initialisation is legitimate.
+        Only a store that was initialised and whose backing has since
+        disappeared is refused -- silently re-manufacturing it would
+        acknowledge writes that are already lost and let ``/ready`` report
+        a healthy store that has quietly dropped every artifact in it.
+        """
+        if self._initialised and not self._backing_present():
+            raise ArtifactStoreError(
+                f"artifact store at {self.root} was initialised but its "
+                "backing storage is no longer present (root/blobs/index/"
+                f"marker not all found) — refusing to {refusing_to}; the "
+                "volume may have been unmounted or deleted"
+            )
 
     # -- atomic write ----------------------------------------------------
 
@@ -245,8 +335,12 @@ class FilesystemArtifactStore:
         already-present marker (its ``created_at_utc`` reflects the store's
         original initialisation, not the most recent call). This is the
         only method on this class that creates anything on disk — the
-        service entrypoint calls it once at startup, and :meth:`put` also
-        calls it lazily on first write so a fresh root works out of the box.
+        service entrypoint calls it once at startup, and :meth:`put` calls
+        it lazily on the first write to a never-yet-initialised root so a
+        fresh root works out of the box. It is *not* called by :meth:`put`
+        for a store whose backing has vanished since initialisation: see
+        the module docstring's "First-time initialisation vs. silent
+        re-creation" section.
         """
         try:
             self.root.mkdir(parents=True, exist_ok=True)
@@ -266,6 +360,11 @@ class FilesystemArtifactStore:
                 }
             ).encode("utf-8")
             self._atomic_write(marker_path, payload)
+
+        # From here on this instance knows the layout existed, so a later
+        # disappearance is a fault to refuse rather than a fresh root to
+        # create.
+        self._initialised = True
 
     # -- ArtifactStore protocol -------------------------------------------
 
@@ -306,10 +405,21 @@ class FilesystemArtifactStore:
 
         blob_path = self._blob_path(computed)
         # Nothing written yet at this point: size/content_type/filename/
-        # checksum are all validated. Only now do we touch disk — starting
-        # with lazy initialisation so a fresh root always has a valid
-        # marker before any blob/sidecar lands in it.
-        self.initialise()
+        # checksum are all validated. Only now do we touch disk.
+        #
+        # A fresh, never-initialised root is initialised here so a store
+        # works out of the box and every blob/sidecar lands beside a valid
+        # marker. A root that was initialised and has since disappeared is
+        # NOT re-created: acknowledging this write would mean returning
+        # 201 for evidence that is already lost, and would flip /ready
+        # back to 200 over a store that had silently dropped everything in
+        # it. This is the artifact-side twin of the metadata store's
+        # _require_durable_backing check on every write.
+        if self._backing_present():
+            self._initialised = True
+        else:
+            self._require_live_backing(refusing_to="register a new artifact")
+            self.initialise()
         self._store_blob(blob_path, data)
 
         record = ArtifactRecord(
@@ -356,6 +466,16 @@ class FilesystemArtifactStore:
         try:
             raw = sidecar_path.read_bytes()
         except FileNotFoundError as exc:
+            # Before blaming the caller's artifact_id, check whether the
+            # store itself still exists. A vanished backing volume makes
+            # *every* lookup miss; reporting that as "not registered" is
+            # false (the artifact is registered — the storage is gone) and
+            # sends the producer to debug an id that was never the
+            # problem. Only reached on the miss branch, so a successful
+            # read pays nothing for this.
+            self._require_live_backing(
+                refusing_to=f"report artifact {artifact_id!r} as unregistered"
+            )
             raise NotFoundError(
                 f"artifact_id {artifact_id!r} is not registered"
             ) from exc
@@ -392,18 +512,19 @@ class FilesystemArtifactStore:
         "healthy" store that has quietly lost every previously registered
         artifact.
         """
-        if (
-            not self.root.is_dir()
-            or not self.blobs_dir.is_dir()
-            or not self.index_dir.is_dir()
-            or not self._marker_path().is_file()
-        ):
+        if not self._backing_present():
             raise ArtifactStoreError(
                 f"artifact store at {self.root} is not initialised, or its "
                 "backing storage is missing (root/blobs/index/marker not "
                 "all present) — call initialise() first, or the volume may "
                 "have been unmounted or deleted"
             )
+
+        # Observing a fully-present layout is itself proof this store was
+        # initialised, so a later disappearance is refused by put()/stat()
+        # even if this instance never called initialise() itself. Nothing
+        # is created here — only an in-memory flag is set.
+        self._initialised = True
 
         probe_path = self.root / f".health-probe-{uuid.uuid4().hex}"
         try:

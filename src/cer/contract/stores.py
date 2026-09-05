@@ -22,7 +22,13 @@ Semantics implementers must honour
   submissions must be detectable, and duplicate run creation must never
   create ambiguous identities.
 
-  The key is *required* only for ``append_evidence``. On the other four
+  :meth:`MetadataStore.register_artifact` is idempotent on
+  ``idempotency_key`` the same way — content-addressing deduplicates an
+  artifact's *bytes*, never its *registration*, so without a key two
+  retries of one logical registration leave two indistinguishable
+  records of the same blob.
+
+  The key is *required* only for ``append_evidence``. On the other five
   it is optional: given no key, an implementation behaves as it would
   for any ordinary create (a fresh identity, a new record). Accepting a
   key and then ignoring it is not a permitted implementation — a
@@ -32,6 +38,11 @@ Semantics implementers must honour
   is ``(producer, idempotency_key)``. For ``record_promotion`` and
   ``record_health`` the producer is taken from the record itself
   (``PromotionTransition.producer`` / ``StrategyHealthRecord.producer``).
+  ``register_artifact`` is the exception: ``ArtifactRecord`` has no
+  producer field, so its producer is an explicit argument, required
+  whenever an ``idempotency_key`` is given and refused (as a
+  ``ContractViolationError``) when it is missing — an unscoped key is
+  not a key.
 
 * **Immutability.** Evidence and artifacts are immutable once written.
   Silent replacement is forbidden: writing a second time to the same
@@ -145,8 +156,33 @@ class MetadataStore(Protocol):
         immutable thereafter — see module docstring."""
         ...
 
-    def register_artifact(self, artifact: ArtifactRecord) -> ArtifactRecord:
-        """Register artifact metadata. Immutable thereafter — see module docstring."""
+    def register_artifact(
+        self,
+        artifact: ArtifactRecord,
+        *,
+        idempotency_key: str | None = None,
+        producer: str | None = None,
+    ) -> ArtifactRecord:
+        """Register artifact metadata. Immutable thereafter, and idempotent
+        on ``idempotency_key`` when one is given — see module docstring.
+
+        ``producer`` scopes the key and is required whenever a key is
+        supplied; it is an explicit argument because ``ArtifactRecord``
+        carries no producer field of its own.
+        """
+        ...
+
+    def find_artifact_by_idempotency_key(
+        self, *, producer: str, idempotency_key: str
+    ) -> ArtifactRecord | None:
+        """Return the artifact registered under this ``(producer,
+        idempotency_key)``, or ``None`` if the key is unused.
+
+        Returns ``None`` rather than raising ``NotFoundError``: an unused
+        key is the normal outcome of a first submission. Callers use it to
+        recognise a retry *before* handing bytes to an ``ArtifactStore``,
+        so a replay never leaves an orphaned blob/sidecar behind.
+        """
         ...
 
     def attach_artifact(

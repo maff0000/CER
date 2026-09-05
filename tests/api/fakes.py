@@ -32,19 +32,34 @@ rejected because of, another producer's use of the same string.
 
 The fake must not model less than the real store
 --------------------------------------------------
-``create_experiment``, ``record_promotion`` and ``record_health`` take an
-optional ``idempotency_key`` here too, and honour it the same way
-``create_run`` does — because the real ``SQLiteMetadataStore`` does. A
-fake that quietly ignored a key the real store honours (or vice versa)
-is precisely how an earlier defect in this project survived two green
-suites: the API tests would pass against a fake that cannot exhibit the
-bug. Any future change to the real store's idempotency semantics belongs
-here in the same commit.
+``create_experiment``, ``record_promotion``, ``record_health`` and
+``register_artifact`` take an optional ``idempotency_key`` here too, and
+honour it the same way ``create_run`` does — because the real
+``SQLiteMetadataStore`` does. A fake that quietly ignored a key the real
+store honours (or vice versa) is precisely how an earlier defect in this
+project survived two green suites: the API tests would pass against a
+fake that cannot exhibit the bug. Any future change to the real store's
+idempotency semantics belongs here in the same commit.
+
+``FakeArtifactStore`` mints a fresh artifact_id per put()
+-----------------------------------------------------------
+It used to derive ``artifact_id`` from the content digest
+(``art_<sha256>``), so two registrations of identical bytes collapsed
+into one record and one id. The real ``FilesystemArtifactStore`` does the
+opposite on purpose: identical bytes share one *blob* but get one
+``artifact_id`` and one sidecar *per registration* (see its module
+docstring, "Every registration gets its own identity"). That divergence
+is exactly what hid the missing artifact idempotency from these tests —
+against this fake a duplicate POST /v1/artifacts appeared to dedup
+perfectly, while against the real store it produced two indistinguishable
+records for one logical registration. The fake now models the real
+store: one blob per digest, one record per put().
 """
 
 from __future__ import annotations
 
 import hashlib
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -52,6 +67,7 @@ from cer.contract.enums import EvidenceType, RunStatus
 from cer.contract.errors import (
     ArtifactStoreError,
     ChecksumMismatchError,
+    ContractViolationError,
     IdempotencyConflictError,
     ImmutabilityError,
     MetadataStoreError,
@@ -97,6 +113,10 @@ class FakeMetadataStore:
         self._evidence: dict[str, EvidenceRecord] = {}
         self._evidence_idempotency: dict[tuple[str, str], str] = {}
         self._artifacts: dict[str, ArtifactRecord] = {}
+        #: (producer, idempotency_key) -> artifact_id. Artifact keys are
+        #: producer-scoped like every other key; ArtifactRecord has no
+        #: producer field, so the producer arrives as an argument.
+        self._artifact_idempotency: dict[tuple[str, str], str] = {}
         self._promotions: list[PromotionTransition] = []
         self._promotion_idempotency: dict[tuple[str, str], PromotionTransition] = {}
         self._health_records: list[StrategyHealthRecord] = []
@@ -273,13 +293,64 @@ class FakeMetadataStore:
 
     # --- artifacts ------------------------------------------------------
 
-    def register_artifact(self, artifact: ArtifactRecord) -> ArtifactRecord:
+    @staticmethod
+    def _artifact_body_key(artifact: ArtifactRecord) -> tuple:
+        """The caller-authored content of an artifact registration.
+
+        Mirrors the real store's _ARTIFACT_IDEM_FP_EXCLUDE: artifact_id,
+        uri and registered_at are assigned by the server per attempt, and
+        run_id/evidence_id are owned by attach_artifact — so none of them
+        distinguish one logical registration from another. What the
+        producer actually submitted is what remains.
+        """
+        return (
+            artifact.sha256,
+            artifact.size_bytes,
+            artifact.content_type,
+            artifact.filename,
+        )
+
+    def find_artifact_by_idempotency_key(
+        self, *, producer: str, idempotency_key: str
+    ) -> Optional[ArtifactRecord]:
+        if not producer or not producer.strip():
+            raise ContractViolationError(
+                f"idempotency_key {idempotency_key!r} requires a non-empty producer"
+            )
+        prior_id = self._artifact_idempotency.get((producer, idempotency_key))
+        return None if prior_id is None else self._artifacts[prior_id]
+
+    def register_artifact(
+        self,
+        artifact: ArtifactRecord,
+        *,
+        idempotency_key: Optional[str] = None,
+        producer: Optional[str] = None,
+    ) -> ArtifactRecord:
+        if idempotency_key is not None:
+            if not producer or not producer.strip():
+                raise ContractViolationError(
+                    f"idempotency_key {idempotency_key!r} requires a non-empty producer "
+                    "to scope it (idempotency keys are scoped per-producer, not global)"
+                )
+            scoped_key = (producer, idempotency_key)
+            prior_id = self._artifact_idempotency.get(scoped_key)
+            if prior_id is not None:
+                prior = self._artifacts[prior_id]
+                if self._artifact_body_key(prior) == self._artifact_body_key(artifact):
+                    return prior
+                raise IdempotencyConflictError(
+                    f"idempotency key {idempotency_key!r} for producer {producer!r} "
+                    "was already used to register a materially different artifact"
+                )
         existing = self._artifacts.get(artifact.artifact_id)
         if existing is not None:
             if existing == artifact:
                 return existing
             raise ImmutabilityError(f"artifact {artifact.artifact_id} already registered with different metadata")
         self._artifacts[artifact.artifact_id] = artifact
+        if idempotency_key is not None:
+            self._artifact_idempotency[(producer, idempotency_key)] = artifact.artifact_id
         return artifact
 
     def attach_artifact(
@@ -428,7 +499,11 @@ class FakeArtifactStore:
     """In-memory, hash-addressed ArtifactStore fake."""
 
     def __init__(self) -> None:
+        #: Keyed by content digest -- identical bytes occupy one blob,
+        #: exactly as the real store's content-addressed layout does.
         self._blobs: dict[str, bytes] = {}
+        #: Keyed by artifact_id -- one record per put(), as the real store
+        #: writes one sidecar per registration.
         self._records: dict[str, ArtifactRecord] = {}
         self.healthy = True
         #: See FakeMetadataStore.simulate_store_error.
@@ -447,31 +522,36 @@ class FakeArtifactStore:
             raise ChecksumMismatchError(
                 f"declared sha256 {declared_sha256!r} does not match computed digest"
             )
-        artifact_id = f"art_{digest}"
-        existing = self._records.get(artifact_id)
-        if existing is not None:
-            # Hash-addressed: identical content is naturally idempotent.
-            return existing
+        # Every registration gets its own identity, as the real store
+        # does: identical bytes share one blob but are two artifacts. A
+        # fake that collapsed them would make duplicate registrations
+        # invisible to these tests -- see the module docstring.
+        artifact_id = f"art_{uuid.uuid4().hex}"
         record = ArtifactRecord(
             artifact_id=artifact_id,
             sha256=digest,
             size_bytes=len(data),
             content_type=content_type,
             filename=filename,
-            uri=f"fake://artifacts/{artifact_id}",
+            uri=f"fake://artifacts/blobs/{digest}",
             registered_at=utcnow(),
         )
-        self._blobs[artifact_id] = data
+        self._blobs[digest] = data
         self._records[artifact_id] = record
         return record
 
     def get(self, artifact_id: str) -> bytes:
         if self.simulate_store_error:
             raise ArtifactStoreError("simulated artifact store failure")
+        record = self._records.get(artifact_id)
+        if record is None:
+            raise NotFoundError(f"artifact {artifact_id} not found")
         try:
-            return self._blobs[artifact_id]
+            return self._blobs[record.sha256]
         except KeyError:
-            raise NotFoundError(f"artifact {artifact_id} not found") from None
+            raise ArtifactStoreError(
+                f"artifact {artifact_id} is registered but its blob is missing"
+            ) from None
 
     def stat(self, artifact_id: str) -> ArtifactRecord:
         if self.simulate_store_error:

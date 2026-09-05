@@ -89,6 +89,17 @@ records: HSA and NEO can each choose a natural key like
 neither can deny or collide with the other's key. Only a producer's own
 retry -- same ``producer`` *and* same ``idempotency_key`` -- is treated
 as a replay of the same logical submission.
+
+``register_artifact`` is the one write path whose producer does not come
+from the record: ``ArtifactRecord`` has no ``producer`` field, and
+``POST /v1/artifacts`` has no producer in its body (the body is the
+artifact's raw bytes). It is therefore passed as an explicit ``producer``
+argument -- supplied by the caller as the ``X-CER-Producer`` header, used
+only to scope the key, and stored on the ``artifacts`` row rather than on
+the contract model, so no artifact record gains a field it did not have.
+An idempotency key without a producer is refused (``ContractViolationError``,
+HTTP 400) exactly as it is at the API layer: a key is only unique within
+the producer that supplied it, so an unscoped key is not a key.
 """
 
 from __future__ import annotations
@@ -104,6 +115,7 @@ from typing import Any, Iterator, Optional
 
 from cer.contract.enums import EvidenceType, HealthState, PromotionState, RunStatus
 from cer.contract.errors import (
+    ContractViolationError,
     ImmutabilityError,
     IdempotencyConflictError,
     MetadataStoreError,
@@ -189,6 +201,21 @@ _HEALTH_FP_EXCLUDE = {"health_id", "observed_at_utc"}
 #: or change them; register_artifact must not treat a differing
 #: attachment as "different content".
 _ARTIFACT_FP_EXCLUDE = {"artifact_id", "run_id", "evidence_id"}
+
+#: Fingerprint for artifact IDEMPOTENCY (producer + key), stored in the
+#: separate artifacts.idempotency_fingerprint column added by
+#: schema/004_artifact_idempotency_keys.sql. It answers a different
+#: question from _ARTIFACT_FP_EXCLUDE's fingerprint ("is this the same
+#: artifact under the same artifact_id?", i.e. immutability by id) and so
+#: must not share its value: this one asks "is this the same logical
+#: registration?". On top of the immutability exclusions it also drops the
+#: two fields the caller never authored -- registered_at, stamped per
+#: attempt by the API layer (the same rule that excludes Run.started_at,
+#: Experiment.created_at, PromotionTransition.at_utc and the rest: include
+#: it and every honest retry becomes a false conflict), and uri, assigned
+#: by the artifact store. What remains is exactly what the producer
+#: submitted: sha256, size_bytes, content_type, filename.
+_ARTIFACT_IDEM_FP_EXCLUDE = _ARTIFACT_FP_EXCLUDE | {"registered_at", "uri"}
 
 
 def _dt_to_str(dt: datetime) -> str:
@@ -851,14 +878,97 @@ class SQLiteMetadataStore:
             evidence_id=row["evidence_id"],
         )
 
-    def register_artifact(self, artifact: ArtifactRecord) -> ArtifactRecord:
+    @staticmethod
+    def _require_producer_for_key(producer: Optional[str], idempotency_key: str) -> str:
+        """Return ``producer``, or refuse an unscoped idempotency key.
+
+        Idempotency keys are scoped to the producer, never global (see the
+        module docstring). A key supplied without a producer is not a
+        weaker key, it is not a key at all -- one producer's choice of a
+        natural key string would silently claim it for everyone. This is
+        the same rule ``cer.api.routes`` enforces before the request ever
+        reaches a store; it lives here too so the store is safe against
+        any caller, not just the HTTP layer.
+        """
+        if producer is None or not producer.strip():
+            raise ContractViolationError(
+                f"idempotency_key {idempotency_key!r} requires a non-empty producer "
+                "to scope it (idempotency keys are scoped per-producer, not global)"
+            )
+        return producer
+
+    def find_artifact_by_idempotency_key(
+        self, *, producer: str, idempotency_key: str
+    ) -> Optional[ArtifactRecord]:
+        """Return the artifact previously registered under this
+        ``(producer, idempotency_key)``, or ``None`` if the key is unused.
+
+        Unlike the ``get_*`` methods this returns ``None`` rather than
+        raising ``NotFoundError``: an unused key is the *normal* outcome
+        on a first submission, not an error. It exists so the API layer
+        can recognise a retry BEFORE handing bytes to the artifact store
+        -- registering the blob first and discovering the replay
+        afterwards would leave an orphan sidecar behind on every retry,
+        addressable by ``/download`` but unknown to this registry.
+
+        It answers only "was this key used?"; whether the resubmission is
+        a faithful replay or a conflicting reuse is decided by
+        :meth:`register_artifact`, which owns the fingerprint comparison.
+        """
+        self._require_producer_for_key(producer, idempotency_key)
+        row = self._conn.execute(
+            "SELECT * FROM artifacts WHERE producer = ? AND idempotency_key = ?",
+            (producer, idempotency_key),
+        ).fetchone()
+        return None if row is None else self._row_to_artifact(row)
+
+    def register_artifact(
+        self,
+        artifact: ArtifactRecord,
+        *,
+        idempotency_key: Optional[str] = None,
+        producer: Optional[str] = None,
+    ) -> ArtifactRecord:
+        """Register artifact metadata, idempotently on ``idempotency_key``
+        when one is given.
+
+        With a key: scoped to ``(producer, idempotency_key)``, a replay
+        with an identical body returns the stored record and a materially
+        different body raises ``IdempotencyConflictError``. Without one,
+        behaviour is unchanged -- a new row, or the pre-existing
+        artifact_id-keyed immutability check for a repeat of the same
+        ``artifact_id``.
+
+        ``producer`` is an explicit argument here, not a field of
+        ``artifact``: ``ArtifactRecord`` has no producer (see the module
+        docstring). It is required whenever ``idempotency_key`` is given.
+        """
         with self._transaction() as conn:
             if artifact.run_id is not None:
                 self._require_run(conn, artifact.run_id)
             if artifact.evidence_id is not None:
                 self._require_evidence(conn, artifact.evidence_id)
 
-            fp = _fingerprint(artifact.model_dump(mode="json"), exclude=_ARTIFACT_FP_EXCLUDE)
+            dumped = artifact.model_dump(mode="json")
+            fp = _fingerprint(dumped, exclude=_ARTIFACT_FP_EXCLUDE)
+            idem_fp = _fingerprint(dumped, exclude=_ARTIFACT_IDEM_FP_EXCLUDE)
+
+            if idempotency_key is not None:
+                self._require_producer_for_key(producer, idempotency_key)
+                # Scoped to (producer, idempotency_key), not the key alone
+                # -- see the module docstring and 002/004.
+                by_key = conn.execute(
+                    "SELECT * FROM artifacts WHERE producer = ? AND idempotency_key = ?",
+                    (producer, idempotency_key),
+                ).fetchone()
+                if by_key is not None:
+                    if by_key["idempotency_fingerprint"] != idem_fp:
+                        raise IdempotencyConflictError(
+                            f"idempotency_key {idempotency_key!r} was already used by "
+                            f"producer {producer!r} to register a materially different "
+                            "artifact"
+                        )
+                    return self._row_to_artifact(by_key)
 
             existing = conn.execute(
                 "SELECT * FROM artifacts WHERE artifact_id = ?", (artifact.artifact_id,)
@@ -874,8 +984,9 @@ class SQLiteMetadataStore:
                 """
                 INSERT INTO artifacts (
                     artifact_id, sha256, size_bytes, content_type, filename, uri,
-                    registered_at, run_id, evidence_id, content_fingerprint
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    registered_at, run_id, evidence_id, content_fingerprint,
+                    producer, idempotency_key, idempotency_fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     artifact.artifact_id,
@@ -888,6 +999,9 @@ class SQLiteMetadataStore:
                     artifact.run_id,
                     artifact.evidence_id,
                     fp,
+                    producer if idempotency_key is not None else None,
+                    idempotency_key,
+                    idem_fp if idempotency_key is not None else None,
                 ),
             )
             return artifact

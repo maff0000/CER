@@ -278,8 +278,9 @@ def test_002_applies_over_populated_001_only_database_and_is_idempotent(tmp_path
         # Every shipped migration, in order: this list grows by one each
         # time a forward-only migration is added to the schema directory
         # (003 added optional producer-scoped idempotency keys for
-        # experiments/promotions/health_records).
-        assert versions == [1, 2, 3]
+        # experiments/promotions/health_records; 004 added them for
+        # artifacts).
+        assert versions == [1, 2, 3, 4]
         assert conn.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"] == 2
     finally:
         conn.close()
@@ -402,7 +403,105 @@ def test_003_applies_over_populated_001_002_database_and_is_idempotent(tmp_path)
         versions = [
             r["version"] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
         ]
-        assert versions == [1, 2, 3]
+        assert versions == [1, 2, 3, 4]
         assert conn.execute("SELECT COUNT(*) AS n FROM promotions").fetchone()["n"] == 4
+    finally:
+        conn.close()
+
+
+def test_004_applies_over_populated_001_003_database_and_is_idempotent(tmp_path):
+    """Migration 004 (optional producer-scoped idempotency keys for
+    artifacts) must apply cleanly as an upgrade over an existing,
+    already-populated 001..003 database -- the real upgrade path for a
+    deployment that predates it -- leave artifacts registered before it
+    intact with NULL keys, and enforce the new composite uniqueness
+    afterwards.
+    """
+    real_schema_dir = Path(__file__).resolve().parents[2] / "src" / "cer" / "metadata" / "schema"
+    migration_004 = real_schema_dir / "004_artifact_idempotency_keys.sql"
+    assert migration_004.is_file()
+
+    pre_004_dir = tmp_path / "schema_pre_004"
+    pre_004_dir.mkdir()
+    for name in (
+        "001_initial.sql",
+        "002_producer_scoped_idempotency.sql",
+        "003_optional_idempotency_keys.sql",
+    ):
+        (pre_004_dir / name).write_text(
+            (real_schema_dir / name).read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    db_path = tmp_path / "upgrade_004.db"
+    conn = _connect(db_path)
+    try:
+        apply_migrations(conn, pre_004_dir)
+
+        # An artifact registered before artifacts had idempotency keys.
+        conn.execute(
+            "INSERT INTO artifacts (artifact_id, sha256, size_bytes, content_type, filename, "
+            "uri, registered_at, content_fingerprint) "
+            "VALUES ('art_old', '" + "a" * 64 + "', 10, 'text/plain', 'legacy.txt', "
+            "'file:///artifacts/legacy.txt', '2026-01-01T00:00:00+00:00', 'fp_legacy')"
+        )
+
+        # Apply the full, real, shipped schema directory on top.
+        apply_migrations(conn, real_schema_dir)
+
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(artifacts)").fetchall()}
+        assert {"producer", "idempotency_key", "idempotency_fingerprint"} <= columns
+
+        index_names = {
+            r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()
+        }
+        assert "ux_artifacts_producer_idempotency_key" in index_names
+
+        # The pre-existing row survived, with a NULL key (it never had one).
+        legacy = conn.execute(
+            "SELECT filename, producer, idempotency_key FROM artifacts WHERE artifact_id = 'art_old'"
+        ).fetchone()
+        assert legacy["filename"] == "legacy.txt"
+        assert legacy["idempotency_key"] is None
+        assert legacy["producer"] is None
+
+        # The key stays OPTIONAL: the partial index must not make two
+        # keyless artifact rows collide.
+        conn.execute(
+            "INSERT INTO artifacts (artifact_id, sha256, size_bytes, content_type, filename, "
+            "uri, registered_at, content_fingerprint) "
+            "VALUES ('art_old_2', '" + "b" * 64 + "', 10, 'text/plain', 'legacy2.txt', "
+            "'file:///artifacts/legacy2.txt', '2026-01-02T00:00:00+00:00', 'fp_legacy2')"
+        )
+
+        # Composite uniqueness where a key IS present: a different producer
+        # may reuse the same key string...
+        for artifact_id, producer in (("art_hsa", "HSA"), ("art_neo", "NEO")):
+            conn.execute(
+                "INSERT INTO artifacts (artifact_id, sha256, size_bytes, content_type, filename, "
+                "uri, registered_at, content_fingerprint, producer, idempotency_key, "
+                "idempotency_fingerprint) "
+                f"VALUES ('{artifact_id}', '" + "c" * 64 + "', 10, 'text/plain', 'r.txt', "
+                f"'file:///artifacts/r.txt', '2026-01-03T00:00:00+00:00', 'fp1', '{producer}', "
+                "'shared-key', 'ifp1')"
+            )
+        # ...but the same producer reusing its own key must not.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO artifacts (artifact_id, sha256, size_bytes, content_type, filename, "
+                "uri, registered_at, content_fingerprint, producer, idempotency_key, "
+                "idempotency_fingerprint) "
+                "VALUES ('art_dup', '" + "c" * 64 + "', 10, 'text/plain', 'r.txt', "
+                "'file:///artifacts/r.txt', '2026-01-03T00:00:00+00:00', 'fp1', 'HSA', "
+                "'shared-key', 'ifp1')"
+            )
+
+        # Re-applying the whole shipped schema directory again is a no-op
+        # (004's ALTER TABLEs are never re-run once recorded).
+        apply_migrations(conn, real_schema_dir)
+        versions = [
+            r["version"] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
+        ]
+        assert versions == [1, 2, 3, 4]
+        assert conn.execute("SELECT COUNT(*) AS n FROM artifacts").fetchone()["n"] == 4
     finally:
         conn.close()

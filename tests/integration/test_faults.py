@@ -20,8 +20,20 @@ The "genuinely unavailable" tests deliberately avoid filesystem permission
 bits (chmod) as the failure mechanism: this suite runs as root in its
 sandbox, and root bypasses permission checks entirely, so a chmod-based
 "failure" would silently not fail at all. Instead each test removes the
-store's backing directory (metadata) or replaces it with a plain file
-(artifacts) -- something no privilege level can paper over.
+store's backing directory -- something no privilege level can paper over.
+
+The artifact-store failure tests cover BOTH ways the backing can be gone:
+
+* ``removed`` -- the directory is simply deleted. This is the ordinary
+  operational case (a volume unmounted, a data directory wiped) and the
+  one that matters: an earlier version of this suite tested only the
+  variant below, which happened to be the single failure mode that could
+  not be papered over by ``put()``'s unconditional lazy ``initialise()``.
+  The suite was green while the write path silently re-manufactured a
+  vanished store, acknowledged 201 for artifacts that were already lost,
+  and flipped ``/ready`` back to 200 over it.
+* ``replaced_by_file`` -- the directory is replaced by a regular file, so
+  even ``mkdir`` fails. Kept as an additional case, not as the only one.
 """
 
 from __future__ import annotations
@@ -86,6 +98,74 @@ def test_materially_different_retry_same_key_is_409(client):
     )
     assert r2.status_code == 409
     assert r2.json()["code"] == "idempotency_conflict"
+
+
+def test_byte_identical_artifact_retry_registers_one_artifact(client, artifact_store):
+    """Retrying one artifact registration must not produce two records.
+
+    Against the REAL stores: the filesystem store mints a fresh
+    artifact_id and writes a fresh sidecar per put(), and content
+    addressing only dedups the blob -- so without the idempotency key
+    being honoured, this retry produced two indistinguishable
+    registrations of the same bytes. The sidecar count is asserted too:
+    the replay must be resolved before the bytes ever reach the artifact
+    store, or every retry leaves an orphaned sidecar on disk that
+    /download would serve but that GET /v1/artifacts/{id} reports as
+    unknown.
+    """
+    payload = b"artifact bytes registered once, submitted twice"
+    request_headers = headers(**{
+        "Content-Type": "text/plain",
+        "X-CER-Filename": "dup.txt",
+        "X-CER-Producer": "HSA",
+        "Idempotency-Key": "fault-dup-artifact-1",
+    })
+
+    r1 = client.post("/v1/artifacts", content=payload, headers=request_headers)
+    r2 = client.post("/v1/artifacts", content=payload, headers=request_headers)
+
+    assert r1.status_code == 201, r1.text
+    assert r2.status_code == 201, r2.text
+    assert r1.json() == r2.json()
+
+    artifact_id = r1.json()["artifact_id"]
+    listed = client.get("/v1/artifacts", headers=headers()).json()
+    assert [a["artifact_id"] for a in listed] == [artifact_id]
+
+    sidecars = [p for p in artifact_store.index_dir.rglob("*.json")]
+    assert len(sidecars) == 1, f"a replay must not leave an orphan sidecar: {sidecars}"
+
+    blobs = [p for p in artifact_store.blobs_dir.rglob("*") if p.is_file()]
+    assert len(blobs) == 1
+
+    # And the one record is genuinely retrievable.
+    download = client.get(f"/v1/artifacts/{artifact_id}/download", headers=headers())
+    assert download.status_code == 200
+    assert download.content == payload
+
+
+def test_materially_different_artifact_retry_same_key_is_409_and_stores_nothing(client, artifact_store):
+    """A conflicting resubmission must be refused before anything is written."""
+    request_headers = headers(**{
+        "Content-Type": "text/plain",
+        "X-CER-Filename": "dup.txt",
+        "X-CER-Producer": "HSA",
+        "Idempotency-Key": "fault-dup-artifact-2",
+    })
+    first = client.post("/v1/artifacts", content=b"the original bytes", headers=request_headers)
+    assert first.status_code == 201, first.text
+
+    blobs_before = {p for p in artifact_store.blobs_dir.rglob("*") if p.is_file()}
+    sidecars_before = {p for p in artifact_store.index_dir.rglob("*.json")}
+
+    conflicting = client.post(
+        "/v1/artifacts", content=b"materially different bytes", headers=request_headers
+    )
+    assert conflicting.status_code == 409, conflicting.text
+    assert conflicting.json()["code"] == "idempotency_conflict"
+
+    assert {p for p in artifact_store.blobs_dir.rglob("*") if p.is_file()} == blobs_before
+    assert {p for p in artifact_store.index_dir.rglob("*.json")} == sidecars_before
 
 
 def test_byte_identical_run_retry_returns_stored_record(client):
@@ -481,7 +561,32 @@ def test_write_refused_after_backing_loss_leaves_no_phantom_record(tmp_path):
 # =====================================================================
 
 
-def test_artifact_store_genuinely_unavailable_is_503_on_ready_and_on_write(tmp_path):
+def _destroy_artifact_backing(artifact_root, mode: str) -> None:
+    """Genuinely destroy the artifact store's backing storage.
+
+    ``removed``: the directory is simply gone -- the ordinary case.
+    ``replaced_by_file``: a regular file sits where the directory was, so
+    even ``mkdir`` fails. Neither is a permission trick (this suite runs
+    as root, which bypasses permission bits entirely).
+    """
+    shutil.rmtree(artifact_root)
+    if mode == "replaced_by_file":
+        artifact_root.write_bytes(b"not a directory any more")
+    elif mode != "removed":  # pragma: no cover - guards a typo in a param id
+        raise AssertionError(f"unknown destruction mode {mode!r}")
+
+
+@pytest.mark.parametrize("mode", ["removed", "replaced_by_file"])
+def test_artifact_store_genuinely_unavailable_is_503_on_ready_and_on_write(tmp_path, mode):
+    """Both failure modes: /ready is 503 AND the write is refused.
+
+    ``removed`` is the case that used to pass only by accident. Before the
+    write path separated first-time initialisation from silent
+    re-creation, ``put()`` called ``initialise()`` unconditionally, so a
+    simply-deleted root was recreated by the very next write: the write
+    was acknowledged 201 and ``/ready`` then reported 200 over a store
+    that had lost everything registered in it.
+    """
     settings = make_settings(tmp_path)
     metadata_store = SQLiteMetadataStore(settings.metadata_db_path)
     artifact_root = tmp_path / "cer_artifacts"
@@ -490,28 +595,82 @@ def test_artifact_store_genuinely_unavailable_is_503_on_ready_and_on_write(tmp_p
     app = create_app(metadata_store, artifact_store, settings)
 
     assert artifact_root.is_dir()
-    # Genuinely destroy the backing storage and replace it with a plain
-    # file so neither health() nor put()'s lazy initialise() can succeed --
-    # this is not a permission trick (this suite runs as root).
-    shutil.rmtree(artifact_root)
-    artifact_root.write_bytes(b"not a directory any more")
+    _destroy_artifact_backing(artifact_root, mode)
 
-    with TestClient(app, raise_server_exceptions=False) as client:
-        resp = client.get("/ready")
-        assert resp.status_code == 503
-        assert resp.json()["failed_dependency"] == "artifact_store"
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.get("/ready")
+            assert resp.status_code == 503
+            assert resp.json()["failed_dependency"] == "artifact_store"
 
-        resp2 = client.post(
-            "/v1/artifacts",
-            content=b"some bytes",
-            headers=headers(**{"X-CER-Filename": "f.txt"}),
-        )
-        assert resp2.status_code == 503, resp2.text
-        body2 = resp2.json()
-        assert body2["code"] == "artifact_store_error"
-        assert "request_id" in body2
-        text = resp2.text.lower()
-        assert "traceback" not in text
+            resp2 = client.post(
+                "/v1/artifacts",
+                content=b"some bytes",
+                headers=headers(**{"X-CER-Filename": "f.txt"}),
+            )
+            assert resp2.status_code == 503, resp2.text
+            body2 = resp2.json()
+            assert body2["code"] == "artifact_store_error"
+            assert "request_id" in body2
+            text = resp2.text.lower()
+            assert "traceback" not in text
+
+            # The refused write must not have repaired readiness by
+            # re-manufacturing the store behind the caller's back.
+            resp3 = client.get("/ready")
+            assert resp3.status_code == 503, resp3.text
+            assert resp3.json()["failed_dependency"] == "artifact_store"
+            if mode == "removed":
+                assert not artifact_root.exists(), (
+                    "the refused write must not have recreated the artifact root"
+                )
+    finally:
+        metadata_store.close()
+
+
+def test_registered_artifact_after_store_vanishes_is_503_not_404(tmp_path):
+    """A vanished store is a server-side failure, not an unknown id.
+
+    The artifact IS registered -- the metadata store still says so. Only
+    the bulk storage is gone. Reporting 404 ("artifact_id ... is not
+    registered") sends the producer to debug an id that was never the
+    problem and hides a live operational fault behind a caller-side
+    status.
+    """
+    settings = make_settings(tmp_path)
+    metadata_store = SQLiteMetadataStore(settings.metadata_db_path)
+    artifact_root = tmp_path / "cer_artifacts"
+    artifact_store = FilesystemArtifactStore(artifact_root, max_bytes=settings.max_artifact_bytes)
+    artifact_store.initialise()
+    app = create_app(metadata_store, artifact_store, settings)
+
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            registered = client.post(
+                "/v1/artifacts",
+                content=b"evidence registered before the volume vanishes",
+                headers=headers(**{"X-CER-Filename": "before.txt"}),
+            )
+            assert registered.status_code == 201, registered.text
+            artifact_id = registered.json()["artifact_id"]
+
+            assert client.get(f"/v1/artifacts/{artifact_id}/download", headers=headers()).status_code == 200
+
+            _destroy_artifact_backing(artifact_root, "removed")
+
+            gone = client.get(f"/v1/artifacts/{artifact_id}/download", headers=headers())
+            assert gone.status_code == 503, gone.text
+            assert gone.json()["code"] == "artifact_store_error"
+
+            # An id that genuinely never existed is a different question,
+            # but with the backing gone the honest answer is still "the
+            # store is unavailable", not a confident 404.
+            unknown = client.get("/v1/artifacts/art_" + "0" * 32 + "/download", headers=headers())
+            assert unknown.status_code == 503, unknown.text
+
+            assert not artifact_root.exists()
+    finally:
+        metadata_store.close()
 
 
 # =====================================================================
