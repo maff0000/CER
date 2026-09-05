@@ -111,6 +111,15 @@ object has ever seen a fully-present backing layout:
   re-creating the layout. A producer that receives ``201`` must be able to
   rely on it.
 
+That distinction is drawn from what *this process* has observed, which is
+enough while the process is running but not across a restart: a service
+starting up against an artifact volume that vanished while it was stopped
+sees only an empty directory, indistinguishable from a first deployment.
+:meth:`mark_previously_initialised` is how the entrypoint hands this store
+the evidence it cannot get from the volume itself — the metadata store's
+own artifact records — so the restart case lands in the same "initialised,
+then vanished" state, with the same refusals, as the live-process case.
+
 The same check guards the *read* path, but only on the miss branch of
 :meth:`stat` so the happy path pays nothing. Without it a vanished store
 reports ``NotFoundError`` → ``404 "artifact_id ... is not registered"``
@@ -364,6 +373,38 @@ class FilesystemArtifactStore:
         # From here on this instance knows the layout existed, so a later
         # disappearance is a fault to refuse rather than a fresh root to
         # create.
+        self._initialised = True
+
+    def mark_previously_initialised(self) -> None:
+        """Record -- on evidence from outside this volume -- that this store
+        *was* initialised, without creating anything.
+
+        This is the only way to reach the "was initialised, has since
+        vanished" state described in the module docstring's "First-time
+        initialisation vs. silent re-creation" section for a store that
+        never observed its own backing. It touches no disk state at all:
+        it sets only the instance flag :meth:`put` and :meth:`stat`
+        consult, so a store whose layout is absent *right now* behaves
+        exactly like one whose layout vanished mid-process -- refusing
+        writes with :class:`~cer.contract.errors.ArtifactStoreError`
+        (HTTP 503) and reporting a storage failure rather than a 404,
+        instead of lazily re-manufacturing an empty store on the first
+        ``put()``.
+
+        The caller must actually hold that evidence. The service
+        entrypoint does: a metadata store holding artifact records
+        alongside an artifact root with no marker is not a first
+        deployment, it is a lost artifact volume -- see
+        ``cer.api.main._initialise_artifact_store_if_safe``. Without
+        this call, :meth:`put`'s lazy first-write initialisation (which
+        is correct for a genuinely fresh root, and cannot tell the two
+        apart by looking at the volume alone) would re-create the layout
+        and acknowledge ``201`` for artifacts that are already gone.
+
+        Idempotent, and safe to call on a store whose backing *is*
+        present: the flag would be set by the next :meth:`health`,
+        :meth:`put` or :meth:`initialise` call anyway.
+        """
         self._initialised = True
 
     # -- ArtifactStore protocol -------------------------------------------

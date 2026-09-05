@@ -40,11 +40,13 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from cer.api.app import create_app
+from cer.api.main import _build_stores
 from cer.artifacts import FilesystemArtifactStore
 from cer.metadata import SQLiteMetadataStore
 
@@ -917,6 +919,124 @@ def test_restart_preserves_evidence_and_artifact_bytes_through_the_api(tmp_path)
         assert resp.status_code == 201, resp.text
 
     metadata_store_2.close()
+
+
+def test_restart_onto_a_lost_artifact_volume_is_503_not_a_lying_200(tmp_path):
+    """Restart durability across TWO separate volumes (R5-RESTART-DURABILITY).
+
+    ``docker-compose.yml`` backs the metadata DB and the artifact root
+    with two independent named volumes. Lose only the artifact volume
+    while the service is stopped and, before this fix, startup's
+    unconditional ``artifact_store.initialise()`` re-manufactured an
+    empty artifact store: ``/ready`` reported 200, ``GET
+    /v1/artifacts/{id}`` still asserted the artifact existed (its
+    metadata was on the intact volume) and only the download 404-ed —
+    registered evidence, silently unretrievable, behind a green
+    readiness probe.
+
+    Driven through ``cer.api.main._build_stores`` — the actual container
+    startup path — rather than by calling ``initialise()`` directly, so
+    it proves the decision the entrypoint makes and not just the store's
+    own guard.
+    """
+    settings = make_settings(tmp_path)
+    artifact_root = Path(settings.artifact_root)
+    payload = b"registered evidence that the artifact volume then loses"
+
+    metadata_store_1, artifact_store_1 = _build_stores(settings)
+    app1 = create_app(metadata_store_1, artifact_store_1, settings)
+    with TestClient(app1, raise_server_exceptions=False) as client1:
+        assert client1.get("/ready").status_code == 200
+
+        resp = client1.post(
+            "/v1/artifacts",
+            content=payload,
+            headers=headers(**{"X-CER-Filename": "before-volume-loss.bin"}),
+        )
+        assert resp.status_code == 201, resp.text
+        artifact_before = resp.json()
+        artifact_id = artifact_before["artifact_id"]
+
+        assert client1.get(f"/v1/artifacts/{artifact_id}/download", headers=headers()).status_code == 200
+
+    metadata_store_1.close()
+    del metadata_store_1, artifact_store_1, app1
+
+    # --- lose ONLY the artifact volume, while the service is stopped ----
+    _destroy_artifact_backing(artifact_root, "removed")
+
+    # --- start again, exactly as the container entrypoint does -----------
+    metadata_store_2, artifact_store_2 = _build_stores(settings)
+    app2 = create_app(metadata_store_2, artifact_store_2, settings)
+    try:
+        with TestClient(app2, raise_server_exceptions=False) as client2:
+            # The whole point: readiness tells the truth.
+            ready = client2.get("/ready")
+            assert ready.status_code == 503, ready.text
+            assert ready.json()["failed_dependency"] == "artifact_store"
+
+            # Startup did not re-create the artifact root behind our back.
+            assert not artifact_root.exists(), (
+                "startup re-created the artifact root over a lost volume"
+            )
+
+            # Writes are refused, and refusing does not repair readiness by
+            # lazily initialising an empty store.
+            write = client2.post(
+                "/v1/artifacts",
+                content=b"a write that must not be acknowledged",
+                headers=headers(**{"X-CER-Filename": "after-volume-loss.bin"}),
+            )
+            assert write.status_code == 503, write.text
+            assert write.json()["code"] == "artifact_store_error"
+            assert not artifact_root.exists()
+            assert client2.get("/ready").status_code == 503
+
+            # The lost artifact reads as a server-side storage failure, not
+            # a 404 blaming an artifact_id that was never the problem.
+            download = client2.get(f"/v1/artifacts/{artifact_id}/download", headers=headers())
+            assert download.status_code == 503, download.text
+            assert download.json()["code"] == "artifact_store_error"
+
+            # ...and its metadata is still readable, so an operator can see
+            # exactly which evidence the lost volume took with it.
+            meta = client2.get(f"/v1/artifacts/{artifact_id}", headers=headers())
+            assert meta.status_code == 200, meta.text
+            assert meta.json() == artifact_before
+    finally:
+        metadata_store_2.close()
+
+
+def test_restart_with_both_volumes_intact_stays_ready(tmp_path):
+    """The control for the test above: the same startup path, nothing
+    destroyed. ``/ready`` is 200 and the artifact is still retrievable —
+    the new startup check must not make an ordinary restart unready."""
+    settings = make_settings(tmp_path)
+    payload = b"ordinary restart, both volumes intact"
+
+    metadata_store_1, artifact_store_1 = _build_stores(settings)
+    app1 = create_app(metadata_store_1, artifact_store_1, settings)
+    with TestClient(app1, raise_server_exceptions=False) as client1:
+        resp = client1.post(
+            "/v1/artifacts",
+            content=payload,
+            headers=headers(**{"X-CER-Filename": "intact.bin"}),
+        )
+        assert resp.status_code == 201, resp.text
+        artifact_id = resp.json()["artifact_id"]
+    metadata_store_1.close()
+    del metadata_store_1, artifact_store_1, app1
+
+    metadata_store_2, artifact_store_2 = _build_stores(settings)
+    app2 = create_app(metadata_store_2, artifact_store_2, settings)
+    try:
+        with TestClient(app2, raise_server_exceptions=False) as client2:
+            assert client2.get("/ready").status_code == 200
+            download = client2.get(f"/v1/artifacts/{artifact_id}/download", headers=headers())
+            assert download.status_code == 200
+            assert download.content == payload
+    finally:
+        metadata_store_2.close()
 
 
 # =====================================================================

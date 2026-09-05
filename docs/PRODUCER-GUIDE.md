@@ -124,7 +124,7 @@ so know where each call you make falls in the table below:
 | `POST /v1/experiments` | `create_experiment` | Optional, honoured when supplied | Every call creates a new experiment |
 | `POST /v1/promotions` | `record_promotion` | Optional, honoured when supplied | Every call records a new transition |
 | `POST /v1/health-records` | `record_health` | Optional, honoured when supplied | Every call records a new health observation |
-| `POST /v1/artifacts` | `register_artifact` | Optional, producer-scoped, honoured when supplied | Every call creates a new artifact *record* (see below — the underlying blob is not duplicated) |
+| `POST /v1/artifacts` | `register_artifact` | Optional, producer-scoped, honoured when supplied — **also requires `producer`/`X-CER-Producer`** | Every call creates a new artifact *record* (see below — the underlying blob is not duplicated) |
 
 **On the optional endpoints, omitting the key does not make the call
 "unsafe" in some vague sense — it means a retry (a timeout you retried, a
@@ -152,6 +152,17 @@ content-addressed, so retries must be safe" — the blob, yes; the record,
 no). Pass an idempotency key when the registration call might be retried
 and you want a retry to hand back the original record instead of minting
 a second one.
+
+**Unlike every other endpoint in this table, `register_artifact` has no
+`producer` field to scope the key with** — the request body is the raw
+artifact bytes, and `ArtifactRecord` itself carries no producer. So the
+key's scope is supplied separately: `client.register_artifact(...,
+producer=..., idempotency_key=...)`, or the `X-CER-Producer` header over
+raw HTTP (see §8). Passing `idempotency_key` without a non-empty
+`producer` is rejected as a `contract_violation` (400) — deliberately: an
+idempotency key that isn't scoped to anyone isn't really a key, it's just
+a string, and CER refuses to pretend otherwise. If you don't pass
+`idempotency_key` at all, `producer` is not required.
 
 In every case, a retry with the **same** producer, the **same** key, and
 an **identical** body returns the stored record — never a duplicate,
@@ -294,11 +305,25 @@ artifact = client.register_artifact(
     content_type="text/csv",
     run_id=run.run_id,
     evidence_id=evidence.evidence_id,
-    idempotency_key="hsa-2026-09-04-equity-curve",  # optional -- see §5
+    producer="HSA",                                   # required alongside idempotency_key -- see §5
+    idempotency_key="hsa-2026-09-04-equity-curve",    # optional -- see §5
 )
 ```
 
-Over raw HTTP, the same call is:
+The full set of headers `POST /v1/artifacts` accepts:
+
+| Header | Required? | Purpose |
+|---|---|---|
+| `X-CER-Contract-Version` | Required (all `/v1/...` calls) | API contract compatibility — see §2 |
+| `X-CER-Filename` | Required | The artifact's filename |
+| `Content-Type` | Optional (defaults to `application/octet-stream`) | The artifact's media type |
+| `X-CER-Declared-Sha256` | Optional | Integrity check against the received bytes — see below |
+| `X-CER-Run-Id` | Optional | Immediate attachment to a run |
+| `X-CER-Evidence-Id` | Optional | Immediate attachment to an evidence record |
+| `Idempotency-Key` | Optional | Retry-safety for the artifact *record* — see §5 |
+| `X-CER-Producer` | Required if `Idempotency-Key` is supplied, otherwise not needed | Scopes the idempotency key — see §5. Not stored on the artifact record itself (`ArtifactRecord` has no producer field) |
+
+Over raw HTTP, a registration call with idempotency is:
 
 ```
 POST /v1/artifacts
@@ -309,8 +334,26 @@ X-CER-Run-Id: run_...            (optional, immediate attachment)
 X-CER-Evidence-Id: ev_...        (optional, immediate attachment)
 X-CER-Declared-Sha256: <hex>     (optional integrity check -- see below)
 Idempotency-Key: <key>           (optional, producer-scoped -- see §5)
+X-CER-Producer: HSA              (required if Idempotency-Key is present -- see §5)
 
 <raw bytes as the body>
+```
+
+Supplying `Idempotency-Key` without `X-CER-Producer` (or with an empty
+one) is a `400 contract_violation` — not silently treated as an unscoped
+key:
+
+```
+POST /v1/artifacts
+X-CER-Contract-Version: 1.0.0
+Content-Type: text/csv
+X-CER-Filename: equity_curve.csv
+Idempotency-Key: k1
+
+<raw bytes as the body>
+
+-> 400 contract_violation
+   "an idempotency key requires a non-empty producer to scope it ..."
 ```
 
 CER computes the SHA-256 of the bytes itself and stores the artifact
