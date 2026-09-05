@@ -921,6 +921,68 @@ def test_restart_preserves_evidence_and_artifact_bytes_through_the_api(tmp_path)
     metadata_store_2.close()
 
 
+def test_restart_preserves_the_resolved_content_type_not_a_form_default(tmp_path):
+    """R7-CONTENT-TYPE, proven against the REAL stores, not fakes.
+
+    A client that sends its transport ``Content-Type`` as the
+    form-encoding default (``curl -d``, ``requests`` with dict/tuple
+    ``data=``) must have that resolved to ``application/octet-stream`` at
+    registration time -- see ``routes._resolve_artifact_content_type`` --
+    and that resolved value, not the transport default, is what a restart
+    must preserve. This also proves the resolution actually happens
+    against the real ``SQLiteMetadataStore``/``FilesystemArtifactStore``
+    wiring, not just the in-memory fakes used in
+    ``tests/api/test_artifact_content_type.py``.
+    """
+    settings = make_settings(tmp_path)
+
+    metadata_store_1 = SQLiteMetadataStore(settings.metadata_db_path)
+    artifact_store_1 = FilesystemArtifactStore(
+        settings.artifact_root, max_bytes=settings.max_artifact_bytes
+    )
+    artifact_store_1.initialise()
+    app1 = create_app(metadata_store_1, artifact_store_1, settings)
+
+    payload = b"field=value&other=thing"
+
+    with TestClient(app1, raise_server_exceptions=False) as client1:
+        resp = client1.post(
+            "/v1/artifacts",
+            content=payload,
+            headers=headers(**{
+                "Content-Type": "application/x-www-form-urlencoded",
+                "X-CER-Filename": "form-default.bin",
+            }),
+        )
+        assert resp.status_code == 201, resp.text
+        artifact_before = resp.json()
+        artifact_id = artifact_before["artifact_id"]
+        assert artifact_before["content_type"] == "application/octet-stream"
+
+    metadata_store_1.close()
+    del metadata_store_1, artifact_store_1, app1
+
+    metadata_store_2 = SQLiteMetadataStore(settings.metadata_db_path)
+    artifact_store_2 = FilesystemArtifactStore(
+        settings.artifact_root, max_bytes=settings.max_artifact_bytes
+    )
+    artifact_store_2.initialise()
+    app2 = create_app(metadata_store_2, artifact_store_2, settings)
+
+    with TestClient(app2, raise_server_exceptions=False) as client2:
+        resp = client2.get(f"/v1/artifacts/{artifact_id}", headers=headers())
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == artifact_before
+        assert resp.json()["content_type"] == "application/octet-stream"
+
+        resp = client2.get(f"/v1/artifacts/{artifact_id}/download", headers=headers())
+        assert resp.status_code == 200
+        assert resp.content == payload
+        assert resp.headers["content-type"].startswith("application/octet-stream")
+
+    metadata_store_2.close()
+
+
 def test_restart_onto_a_lost_artifact_volume_is_503_not_a_lying_200(tmp_path):
     """Restart durability across TWO separate volumes (R5-RESTART-DURABILITY).
 

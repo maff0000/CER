@@ -429,7 +429,69 @@ ARTIFACT_EVIDENCE_ID_HEADER = "X-CER-Evidence-Id"
 #: Scopes an Idempotency-Key on this endpoint only. Not stored on the
 #: ArtifactRecord (which has no producer field) — see create_artifact.
 ARTIFACT_PRODUCER_HEADER = "X-CER-Producer"
+#: Optional, explicit content-type declaration. Takes precedence over the
+#: transport ``Content-Type`` header — see _resolve_artifact_content_type.
+ARTIFACT_CONTENT_TYPE_HEADER = "X-CER-Content-Type"
 _DEFAULT_ARTIFACT_CONTENT_TYPE = "application/octet-stream"
+#: Transport-framing content types an HTTP client sets automatically
+#: (curl's -d, requests' default for dict/tuple ``data=``) that describe
+#: how the *request* was encoded, never what the artifact bytes *are*.
+#: This endpoint takes the raw body verbatim and never parses form
+#: encoding, so neither value can ever be a truthful declaration of an
+#: artifact's content type -- see _resolve_artifact_content_type.
+_FORM_ENCODED_MEDIA_TYPES = frozenset(
+    {"application/x-www-form-urlencoded", "multipart/form-data"}
+)
+
+
+def _is_form_encoded_media_type(content_type: str) -> bool:
+    """True if ``content_type``'s media type (ignoring params/case/whitespace)
+    is one of the transport form-encoding defaults."""
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    return media_type in _FORM_ENCODED_MEDIA_TYPES
+
+
+def _resolve_artifact_content_type(
+    transport_content_type: Optional[str], declared_content_type: Optional[str]
+) -> str:
+    """Return the content type to record for a new artifact.
+
+    The transport ``Content-Type`` header is populated automatically by
+    every HTTP client, often to a form-encoding default
+    (``application/x-www-form-urlencoded``, ``multipart/form-data``,
+    with or without parameters) that describes how the *request* was
+    framed, not what the artifact *is*. ``POST /v1/artifacts`` never
+    parses form encoding -- it takes the raw body verbatim as the
+    artifact's bytes -- so a form-encoding value can never be a truthful
+    declaration of an artifact's content type. Recording it anyway would
+    burn a client default into a permanent, immutable evidence record
+    (PID Artifact doctrine: CER must "preserve content/type metadata" --
+    a client default is not preserved metadata, it's wrong metadata that
+    looks authoritative and, once written, cannot be corrected).
+
+    ``X-CER-Content-Type`` (declared_content_type) is an optional,
+    explicit declaration channel for a producer whose HTTP client
+    controls the transport header and won't let it be set to the real
+    type. When present -- and not itself a form-encoding default -- it
+    takes precedence over the transport header.
+
+    Any other, non-form-encoded value from either source is a genuine
+    declaration and is returned exactly as given: no stripping,
+    normalising, or case-folding of the value that gets recorded --
+    only the classification check above is case/whitespace/parameter
+    insensitive. Absent, empty, or form-encoded input from both sources
+    falls back to the existing honest default for "the producer did not
+    tell us".
+    """
+    for candidate in (declared_content_type, transport_content_type):
+        if not candidate:
+            continue
+        if not candidate.strip():
+            continue
+        if _is_form_encoded_media_type(candidate):
+            continue
+        return candidate
+    return _DEFAULT_ARTIFACT_CONTENT_TYPE
 
 
 @api_router.post("/artifacts", response_model=ArtifactRecord, status_code=201)
@@ -443,6 +505,9 @@ async def create_artifact(
     evidence_id: Optional[str] = Header(default=None, alias=ARTIFACT_EVIDENCE_ID_HEADER),
     producer: Optional[str] = Header(default=None, alias=ARTIFACT_PRODUCER_HEADER),
     idempotency_key_header: Optional[str] = Header(default=None, alias=IDEMPOTENCY_KEY_HEADER),
+    content_type_declared: Optional[str] = Header(
+        default=None, alias=ARTIFACT_CONTENT_TYPE_HEADER
+    ),
 ) -> ArtifactRecord:
     """Register an artifact.
 
@@ -450,10 +515,24 @@ async def create_artifact(
     upload — see the Engineer report for why: it keeps this endpoint
     dependency-free). Metadata travels as headers: ``X-CER-Filename``
     (required), ``Content-Type`` (optional, defaults to
-    ``application/octet-stream``), ``X-CER-Declared-Sha256`` (optional
-    integrity check), ``X-CER-Run-Id``/``X-CER-Evidence-Id`` (optional
-    immediate attachment), and ``Idempotency-Key`` + ``X-CER-Producer``
-    (optional retry-safety, see below).
+    ``application/octet-stream`` — see below), ``X-CER-Content-Type``
+    (optional, explicit override — see below), ``X-CER-Declared-Sha256``
+    (optional integrity check), ``X-CER-Run-Id``/``X-CER-Evidence-Id``
+    (optional immediate attachment), and ``Idempotency-Key`` +
+    ``X-CER-Producer`` (optional retry-safety, see below).
+
+    Content type
+    ------------
+    The transport ``Content-Type`` header is populated automatically by
+    every HTTP client — often to a form-encoding default
+    (``application/x-www-form-urlencoded``, ``multipart/form-data``) that
+    describes how the request was framed, not what the artifact is. This
+    endpoint never parses form encoding, so such a value is treated as
+    "not declared" and recorded as ``application/octet-stream`` instead
+    of verbatim. ``X-CER-Content-Type`` lets a producer declare the real
+    type explicitly when its client won't let it set the transport header
+    directly; it takes precedence when present. See
+    :func:`_resolve_artifact_content_type` for the exact rule.
 
     Idempotency
     ------------
@@ -491,7 +570,9 @@ async def create_artifact(
             f"({settings.max_artifact_bytes})"
         )
 
-    content_type = request.headers.get("content-type") or _DEFAULT_ARTIFACT_CONTENT_TYPE
+    content_type = _resolve_artifact_content_type(
+        request.headers.get("content-type"), content_type_declared
+    )
 
     idem_key = idempotency_key_header or None
     if idem_key:
